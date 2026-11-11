@@ -96,6 +96,40 @@ int32_t compositeFromBlendMode(BlendMode m) {
     }
 }
 
+namespace {
+
+// Layer Property effects.  The engine's border width is whole pixels (1..50);
+// CSP stores a double, so it is rounded and clamped on the way in.
+void readEffects(const clip_layer_effects& fx, Layer& l) {
+    l.borderOn = fx.border != 0;
+    if (l.borderOn) {
+        int w = static_cast<int>(fx.border_width + 0.5);
+        l.borderWidth = w < 1 ? 1 : (w > 50 ? 50 : w);
+        l.borderColor = Color::rgba(fx.border_color[0], fx.border_color[1], fx.border_color[2]);
+    }
+    l.layerColorOn = fx.layer_color != 0;
+    if (l.layerColorOn) l.layerColor = Color::rgba(fx.layer_color_rgb[0], fx.layer_color_rgb[1], fx.layer_color_rgb[2]);
+    l.gray = fx.expression_color == CLIP_EXPRESSION_GRAY;  // Monochrome has no engine equivalent
+}
+
+clip_layer_effects writeEffects(const Layer& l) {
+    clip_layer_effects fx{};
+    fx.border = l.borderOn && l.borderWidth > 0;
+    fx.border_width = l.borderWidth;
+    fx.border_color[0] = l.borderColor.r;
+    fx.border_color[1] = l.borderColor.g;
+    fx.border_color[2] = l.borderColor.b;
+    fx.layer_color = l.layerColorOn;
+    fx.layer_color_rgb[0] = l.layerColor.r;
+    fx.layer_color_rgb[1] = l.layerColor.g;
+    fx.layer_color_rgb[2] = l.layerColor.b;
+    // A Gray layer is stored as gray in the file, as CSP does: its colours are not kept.
+    fx.expression_color = l.gray ? CLIP_EXPRESSION_GRAY : CLIP_EXPRESSION_COLOR;
+    return fx;
+}
+
+}  // namespace
+
 bool toDocument(const clip_document* cd, Document& doc, std::string* error) {
     const clip_canvas_info* cv = clip_document_canvas(cd);
     int w = static_cast<int>(cv->width), h = static_cast<int>(cv->height);
@@ -120,6 +154,7 @@ bool toDocument(const clip_document* cd, Document& doc, std::string* error) {
         l->clipToBelow = li.clip != 0;
         l->opacity = li.opacity / 256.f;
         l->mode = blendModeFromComposite(li.composite);
+        readEffects(li.effects, *l);
         ImageHolder px;
         clip_error e{};
         if (clip_document_render_layer(cd, &li, &px.img, &e)) {
@@ -168,6 +203,7 @@ struct WriteInput {
             o.clip = l.clipToBelow;
             o.opacity = static_cast<int32_t>(l.opacity * 256 + 0.5f);
             o.composite = compositeFromBlendMode(l.mode);
+            o.effects = writeEffects(l);
         }
         doc.width = d.width();
         doc.height = d.height();

@@ -73,6 +73,51 @@ TEST(clip_write_then_read_document) {
     CHECK(cd && clip_document_row_count(cd.get(), "CanvasPreview") == 0);
 }
 
+TEST(clip_layer_effects_roundtrip) {
+    Document doc(64, 64);
+    Layer* a = doc.addLayerTop("Bordered");
+    a->surface.fillRect(Rect{8, 8, 20, 20}, Color::rgba(200, 40, 10, 255));
+    a->borderOn = true;
+    a->borderWidth = 7;
+    a->borderColor = Color::rgba(0x12, 0x34, 0x56);
+    a->layerColorOn = true;
+    a->layerColor = Color::rgba(40, 120, 230);
+    Layer* b = doc.addLayerTop("Gray");
+    b->surface.fillRect(Rect{8, 8, 20, 20}, Color::rgba(200, 40, 10, 255));
+    b->gray = true;
+    Layer* c = doc.addLayerTop("Plain");
+
+    std::string err;
+    std::vector<uint8_t> file = buildClipFile(doc, {}, &err);
+    CHECK(!file.empty());
+    if (file.empty()) { std::printf("  %s\n", err.c_str()); return; }
+    clip_document* raw = nullptr;
+    clip_error e{};
+    CHECK(clip_document_open_memory(&raw, file.data(), file.size(), &e));
+    DocumentPtr cd(raw);
+    if (!cd) { std::printf("  %s\n", e.message); return; }
+    Document back;
+    CHECK(toDocument(cd.get(), back, &err));
+    CHECK_EQ(back.layerCount(), size_t(3));
+
+    const Layer* ba = back.layer(0);
+    CHECK(ba->borderOn);
+    CHECK_EQ(ba->borderWidth, 7);
+    CHECK(ba->borderColor == Color::rgba(0x12, 0x34, 0x56));
+    CHECK(ba->layerColorOn);
+    CHECK(ba->layerColor == Color::rgba(40, 120, 230));
+    CHECK(!ba->gray);
+    CHECK(ba->surface.at(10, 10) == Color::rgba(200, 40, 10, 255));
+
+    const Layer* bb = back.layer(1);
+    CHECK(bb->gray && !bb->borderOn && !bb->layerColorOn);
+    CHECK(bb->surface.at(10, 10) == Color::rgba(84, 84, 84, 255));  // stored as luma
+
+    const Layer* bc = back.layer(2);
+    CHECK(!bc->hasEffects() && !bc->layerColorOn);
+    (void)c;
+}
+
 TEST(clip_blend_mode_mapping_roundtrips) {
     const BlendMode modes[] = {BlendMode::Normal,   BlendMode::Multiply,  BlendMode::Screen,     BlendMode::Overlay,
                                BlendMode::Darken,   BlendMode::Lighten,   BlendMode::ColorDodge, BlendMode::ColorBurn,
