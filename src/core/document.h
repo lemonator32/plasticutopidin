@@ -16,13 +16,36 @@ struct Layer {
     float opacity = 1.f;         // 0..1
     bool visible = true;
     bool locked = false;
+    bool lockAlpha = false;      // "lock transparent pixels": painting keeps the layer's existing alpha
     bool clipToBelow = false;    // clipping layer: only paints where the layer below is opaque
     uint64_t id = 0;             // stable identity for undo commands
+
+    // Layer Property effects (display only; the pixels are unchanged).
+    bool gray = false;                                   // expression color: gray
+    bool layerColorOn = false;                           // "Layer color": dark tones show in layerColor
+    Color layerColor = Color::rgba(40, 120, 230);
+    bool borderOn = false;                               // "Border effect": an outline around the layer's pixels
+    int borderWidth = 4;                                 // pixels, 1..50
+    Color borderColor = Color::rgba(255, 255, 255);
+    bool hasEffects() const { return gray || layerColorOn || (borderOn && borderWidth > 0); }
 
     std::unique_ptr<Layer> clone() const {
         auto l = std::make_unique<Layer>(*this);
         return l;
     }
+};
+
+// The selected area: a canvas-sized coverage mask (0 = outside, 255 = inside).
+// Inactive means "no selection": everything is editable.
+struct Selection {
+    bool active = false;
+    Rect bounds;                 // bounding box of the non-zero mask
+    std::vector<uint8_t> mask;   // width * height when active
+    int width = 0;
+    uint64_t version = 0;        // changes whenever the mask does (for cached outlines)
+
+    uint8_t at(int x, int y) const { return active ? mask[static_cast<size_t>(y) * width + x] : 255; }
+    bool contains(int x, int y) const { return at(x, y) != 0; }
 };
 
 class Document {
@@ -36,6 +59,7 @@ public:
     double dpi = 350.0;
     Color paperColor = Color::rgba(255, 255, 255);
     bool paperVisible = true;
+    Selection selection;
 
     // Layer stack. Index 0 is the bottom-most layer.
     size_t layerCount() const { return layers_.size(); }
@@ -57,6 +81,8 @@ public:
     // Render the visible layer stack (optionally over the paper colour) into `out`,
     // limited to `clip` in canvas coordinates. `out` must be canvas-sized.
     void composite(Surface& out, Rect clip) const;
+    // A layer's pixels within `clip` as displayed: with its Layer Property effects applied.
+    Surface layerDisplay(const Layer& l, Rect clip) const;
     Surface flatten() const;
 
     uint64_t nextId() { return ++idCounter_; }
