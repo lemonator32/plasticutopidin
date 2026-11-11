@@ -1,3 +1,4 @@
 [submodule "libclip"]
 	path = libclip
 	url = https://github.com/lemonator32/libclip
+	branch = plasticutopidin/main
