@@ -50,8 +50,9 @@ if(WIN32)
 endif()
 
 # ---- tests ------------------------------------------------------------------
-add_executable(pu_tests tests/test_main.cpp tests/test_core.cpp tests/test_clip.cpp)
+add_executable(pu_tests tests/test_main.cpp tests/test_core.cpp tests/test_clip.cpp tests/test_app.cpp app/app_state.cpp)
 target_link_libraries(pu_tests PRIVATE pu_clip)
+target_include_directories(pu_tests PRIVATE app)
 add_test(NAME unit COMMAND pu_tests)
 
 # ---- Windows paint application ----------------------------------------------
