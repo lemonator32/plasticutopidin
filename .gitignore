@@ -1,3 +1,7 @@
+# Folder for testing .clip files
+/test_files/
+
+# CMake files
 CMakeLists.txt.user
 CMakeCache.txt
 CMakeFiles
