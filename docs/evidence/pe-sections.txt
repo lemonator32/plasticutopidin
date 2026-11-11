@@ -1,0 +1,24 @@
+##### CLIPStudioPaint.exe 94514584
+  .text    va=00001000 vsize= 71214412 raw= 71214592 chars=60000020
+  .rdata   va=043ec000 vsize= 14304344 raw= 14304768 chars=40000040
+  .data    va=05191000 vsize=  5142896 raw=  2381312 chars=c0000040
+  .pdata   va=05679000 vsize=  2231892 raw=  2232320 chars=40000040
+  _RDATA   va=0589a000 vsize=     9224 raw=     9728 chars=40000040
+  .rsrc    va=0589d000 vsize=  3893856 raw=  3894272 chars=40000040
+  .reloc   va=05c54000 vsize=   462828 raw=   462848 chars=42000040
+##### iswCoreTG.dll 4540888
+  .text    va=00001000 vsize=  3207583 raw=  3207680 chars=60000020
+  .rdata   va=00311000 vsize=   982436 raw=   982528 chars=40000040
+  .data    va=00401000 vsize=   310380 raw=   190464 chars=c0000040
+  .pdata   va=0044d000 vsize=   115560 raw=   115712 chars=40000040
+  _RDATA   va=0046a000 vsize=      452 raw=      512 chars=40000040
+  .rsrc    va=0046b000 vsize=     1328 raw=     1536 chars=40000040
+  .reloc   va=0046c000 vsize=    26140 raw=    26624 chars=42000040
+##### iswCmnTG.dll 1184728
+  .text    va=00001000 vsize=   843708 raw=   843776 chars=60000020
+  .rdata   va=000cf000 vsize=   279272 raw=   279552 chars=40000040
+  .data    va=00114000 vsize=    17804 raw=     5120 chars=c0000040
+  .pdata   va=00119000 vsize=    33684 raw=    33792 chars=40000040
+  _RDATA   va=00122000 vsize=      148 raw=      512 chars=40000040
+  .rsrc    va=00123000 vsize=     1360 raw=     1536 chars=40000040
+  .reloc   va=00124000 vsize=     4184 raw=     4608 chars=42000040
