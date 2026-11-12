@@ -19,8 +19,13 @@ enum : WORD {
     IdStopPos,
     IdStopReverse,
     IdShape,
+    IdRepeat,
+    IdPreserveLuma,
     IdNote,
 };
+
+// The tone curve is edited through the outputs of five fixed inputs.
+constexpr int kCurveInputs[5] = {0, 64, 128, 192, 255};
 
 struct SliderSpec {
     const wchar_t* label;
@@ -34,6 +39,7 @@ struct Session {
     GradientFill grad;              // Gradient layers
     std::vector<GradientStop>* stops = nullptr;  // the stop list being edited (grad.stops or adj.stops)
     std::vector<SliderSpec> sliders;
+    int curveOut[5] = {0, 64, 128, 192, 255};  // Tone curve: outputs at kCurveInputs
     bool syncing = false;           // setting controls from code: ignore their notifications
 };
 
@@ -54,6 +60,10 @@ void apply(Session& s) {
     } else {
         Adjustment a = s.adj;
         std::stable_sort(a.stops.begin(), a.stops.end(), [](auto& p, auto& q) { return p.pos < q.pos; });
+        if (a.kind == Adjustment::Kind::ToneCurve) {
+            a.curve.clear();
+            for (int i = 0; i < 5; ++i) a.curve.push_back({kCurveInputs[i], s.curveOut[i]});
+        }
         g.state.setAdjustment(std::move(a));
     }
     updateComposite(g.state.doc.bounds());
@@ -101,7 +111,12 @@ INT_PTR CALLBACK settingsProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
                 SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Linear"));
                 SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Circle"));
                 SendMessageW(cb, CB_SETCURSEL, s->grad.shape == GradientFill::Shape::Radial ? 1 : 0, 0);
+                HWND rp = GetDlgItem(dlg, IdRepeat);
+                for (const wchar_t* t : {L"None", L"Repeat", L"Flip"}) SendMessageW(rp, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(t));
+                SendMessageW(rp, CB_SETCURSEL, static_cast<WPARAM>(s->grad.repeat), 0);
             }
+            if (s->kind == LayerKind::Adjustment && s->adj.kind == Adjustment::Kind::ColorBalance)
+                CheckDlgButton(dlg, IdPreserveLuma, s->adj.preserveLuminosity ? BST_CHECKED : BST_UNCHECKED);
             s->syncing = false;
             refreshStops(dlg, *s, 0);
             g.state.beginPropertyEdit();
@@ -137,6 +152,16 @@ INT_PTR CALLBACK settingsProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
             if (id == IdShape && code == CBN_SELCHANGE) {
                 s->grad.shape = SendDlgItemMessageW(dlg, IdShape, CB_GETCURSEL, 0, 0) == 1 ? GradientFill::Shape::Radial
                                                                                           : GradientFill::Shape::Linear;
+                apply(*s);
+                return TRUE;
+            }
+            if (id == IdRepeat && code == CBN_SELCHANGE) {
+                s->grad.repeat = static_cast<GradientFill::Repeat>(std::clamp<int>(static_cast<int>(SendDlgItemMessageW(dlg, IdRepeat, CB_GETCURSEL, 0, 0)), 0, 2));
+                apply(*s);
+                return TRUE;
+            }
+            if (id == IdPreserveLuma && code == BN_CLICKED) {
+                s->adj.preserveLuminosity = IsDlgButtonChecked(dlg, IdPreserveLuma) == BST_CHECKED;
                 apply(*s);
                 return TRUE;
             }
@@ -208,7 +233,8 @@ INT_PTR CALLBACK settingsProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 
 void appendCorrectionMenu(HMENU m) {
     using K = Adjustment::Kind;
-    for (K k : {K::BrightnessContrast, K::Levels, K::HueSaturation, K::Invert, K::GradientMap})
+    for (K k : {K::BrightnessContrast, K::Levels, K::ToneCurve, K::HueSaturation, K::ColorBalance, K::Invert, K::Posterize, K::Binarize,
+                K::GradientMap})
         AppendMenuW(m, MF_STRING, static_cast<UINT_PTR>(CmdAdjustBase + static_cast<int>(k)), widen(Adjustment::kindName(k)).c_str());
 }
 
@@ -264,6 +290,27 @@ void layerSettingsDialog() {
                 if (a.stops.empty()) a.stops = Adjustment::make(K::GradientMap).stops;
                 s.stops = &a.stops;
                 break;
+            case K::ToneCurve: {
+                // The current curve sampled at the five inputs.
+                std::vector<uint8_t> t(256);
+                for (int i = 0; i < 256; ++i) t[static_cast<size_t>(i)] = static_cast<uint8_t>(i);
+                applyCurve(t, a.curve);
+                for (int i = 0; i < 5; ++i) s.curveOut[i] = t[static_cast<size_t>(kCurveInputs[i])];
+                if (!a.raw.empty()) note = L"Editing replaces the per-channel curves read from the file with this master curve.";
+                s.sliders = {{L"Black (0)", 0, 255, &s.curveOut[0]}, {L"Shadows (64)", 0, 255, &s.curveOut[1]},
+                             {L"Midtones (128)", 0, 255, &s.curveOut[2]}, {L"Highlights (192)", 0, 255, &s.curveOut[3]},
+                             {L"White (255)", 0, 255, &s.curveOut[4]}};
+                break;
+            }
+            case K::ColorBalance:
+                s.sliders = {{L"Shadows: cyan-red", -100, 100, &a.balance[0]}, {L"Shadows: magenta-green", -100, 100, &a.balance[1]},
+                             {L"Shadows: yellow-blue", -100, 100, &a.balance[2]}, {L"Midtones: cyan-red", -100, 100, &a.balance[3]},
+                             {L"Midtones: magenta-green", -100, 100, &a.balance[4]}, {L"Midtones: yellow-blue", -100, 100, &a.balance[5]},
+                             {L"Highlights: cyan-red", -100, 100, &a.balance[6]}, {L"Highlights: magenta-green", -100, 100, &a.balance[7]},
+                             {L"Highlights: yellow-blue", -100, 100, &a.balance[8]}};
+                break;
+            case K::Posterize: s.sliders = {{L"Levels", 2, 20, &a.a}}; break;
+            case K::Binarize: s.sliders = {{L"Threshold", 0, 255, &a.a}}; break;
             case K::Invert: note = L"Reverse gradient has no settings."; break;
             default: note = L"This correction can be shown and saved, but not edited here."; break;
         }
@@ -280,7 +327,16 @@ void layerSettingsDialog() {
         const short yy = y;
         add([=](DlgBuilder& d) { d.item(SS_LEFT, pad, yy + 2, 40, 10, 0xFFFF, DlgBuilder::Static, L"Shape:"); });
         add([=](DlgBuilder& d) { d.item(CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 50, yy, 80, 60, IdShape, DlgBuilder::ComboBox, L""); });
+        add([=](DlgBuilder& d) { d.item(SS_LEFT, 140, yy + 2, 40, 10, 0xFFFF, DlgBuilder::Static, L"Repeat:"); });
+        add([=](DlgBuilder& d) { d.item(CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, yy, 70, 60, IdRepeat, DlgBuilder::ComboBox, L""); });
         y += 20;
+    }
+    if (s.kind == LayerKind::Adjustment && s.adj.kind == K::ColorBalance) {
+        const short yy = y;
+        add([=](DlgBuilder& d) {
+            d.item(BS_AUTOCHECKBOX | WS_TABSTOP, pad, yy, 120, 12, IdPreserveLuma, DlgBuilder::Button, L"Preserve luminosity");
+        });
+        y += 16;
     }
     for (size_t i = 0; i < s.sliders.size(); ++i) {
         const short yy = y;

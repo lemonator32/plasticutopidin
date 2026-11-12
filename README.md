@@ -21,6 +21,13 @@ are trademarks of CELSYS, Inc.
   damps pen jitter.
 * **Layers**: add, delete, duplicate, merge down, reorder, hide, clear. Each
   layer has opacity, a blend mode and an optional "clip to layer below".
+* **Folders, layer masks and non-raster layers**: folders (with
+  pass-through), layer masks that every pixel tool can paint on, fill
+  layers, gradient layers (linear or radial, with repeat and flip) and
+  correction layers: Brightness/Contrast, Level correction, Tone curve,
+  Hue/Saturation/Luminosity, Color balance, Reverse gradient, Posterization,
+  Binarization and Gradient map. All of them are edited live from the Layer
+  settings dialog and saved to `.clip`.
 * **18 blend modes**: Normal, Multiply, Screen, Overlay, Darken, Lighten,
   Color Dodge, Color Burn, Hard Light, Soft Light, Difference, Exclusion,
   Add, Subtract, Hue, Saturation, Color and Luminosity, following the W3C
@@ -146,13 +153,14 @@ docs/          research notes on Clip Studio Paint and design notes for src/
 
 ## Status and limits
 
-* Raster layers only. Vector, text, tone and other special layers in a
-  `.clip` file open as empty layers, with the reason added to the layer
-  name.
+* Vector, text, tone, 3-D and other special layers in a `.clip` file open
+  as their rendered pixels (a raster layer); they cannot be edited as
+  vectors or text, and are saved back as raster layers.
 * 8-bit RGBA documents only, not 16-bit or CMYK.
-* No folders or masks. When a `.clip` opens, folders are dropped (their
-  layers stay, in order) and layer masks are applied to the layer's pixels.
-  Plastic Paint saves a flat list of layers.
+* Gradient layers from Clip Studio Paint are read when they are linear
+  (the only shape seen in CSP files); a radial gradient layer is saved as
+  pixels. A tone curve with per-channel curves is shown as read, and editing
+  it replaces those curves with one master curve.
 * Windows only for the application. The engine and `cliptool` are portable
   C++20.
 

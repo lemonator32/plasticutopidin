@@ -1,7 +1,9 @@
 // Document model: a canvas with an ordered stack of raster layers.
 #pragma once
+#include <algorithm>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "blend.h"
@@ -21,14 +23,25 @@ Color sampleStops(const std::vector<GradientStop>& stops, float t);
 
 // The settings of a gradient layer.  The gradient runs from (x0, y0) to
 // (x1, y1) in canvas pixels: across that line (Linear) or out from (x0, y0)
-// with radius |(x1, y1) - (x0, y0)| (Radial).  Beyond the ends the end colours continue.
+// with radius |(x1, y1) - (x0, y0)| (Radial).  Beyond the ends the end
+// colours continue (None), the gradient starts over (Repeat) or runs back
+// and forth (Flip).
 struct GradientFill {
     enum class Shape : uint8_t { Linear, Radial };
+    enum class Repeat : uint8_t { None, Repeat, Flip };
     Shape shape = Shape::Linear;
+    Repeat repeat = Repeat::None;
     std::vector<GradientStop> stops{{0.f, Color::rgba(0, 0, 0)}, {1.f, Color::rgba(255, 255, 255)}};
     float x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f;
     bool operator==(const GradientFill&) const = default;
 };
+
+// A tone curve's control points: (input, output) in 0..255.
+using CurvePoints = std::vector<std::pair<int, int>>;
+// Maps every entry of `table` through the curve: a monotone cubic spline
+// through the points (sorted by input here), flat beyond the end points, the
+// identity with fewer than two points.
+void applyCurve(std::vector<uint8_t>& table, const CurvePoints& points);
 
 // A correction ("filter") layer: instead of pixels, it recolours everything
 // composited below it.  The adjusted result is blended over the stack with
@@ -38,15 +51,23 @@ struct Adjustment {
         None,
         BrightnessContrast,  // a = brightness, b = contrast (-100..100)
         Levels,              // a, b, c = input black, gamma point, input white (0..255); d, e = output black, white
-        ToneCurve,           // lut only (read from files)
+        ToneCurve,           // curve: the master (RGB) curve; files may add per-channel curves, kept only in lut
         HueSaturation,       // a = hue (degrees, -180..180), b = saturation, c = luminosity (-100..100)
-        ColorBalance,        // lut only (read from files)
+        ColorBalance,        // balance, preserveLuminosity
         Invert,
         GradientMap,         // stops (indexed by the pixel's luminance)
+        Posterize,           // a = number of levels per channel (2..20)
+        Binarize,            // a = threshold (0..255) on the pixel's luminance
+        Count
     };
     Kind kind = Kind::None;
     int a = 0, b = 0, c = 0, d = 0, e = 0;
     std::vector<GradientStop> stops;  // GradientMap
+    CurvePoints curve;                // ToneCurve
+    // ColorBalance: shadows, midtones, highlights, each as cyan-red,
+    // magenta-green, yellow-blue (-100..100).
+    int balance[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    bool preserveLuminosity = true;   // ColorBalance: keep each pixel's luminance
     // Per-channel lookup tables (R, G, B) for the table-driven kinds; for
     // GradientMap the index is the pixel's luminance.  Built by rebuild().
     std::vector<uint8_t> lut[3];
@@ -56,13 +77,12 @@ struct Adjustment {
     std::vector<uint8_t> raw;
 
     bool active() const { return kind != Kind::None; }
-    // Can the parameters be edited (and written) from a, b, c, d, e and stops?
-    bool editable() const { return kind != Kind::ToneCurve && kind != Kind::ColorBalance; }
-    // Regenerates the lookup tables from the parameters (the editable kinds).
+    // Regenerates the lookup tables from the parameters.
     void rebuild();
     Color apply(Color c) const;
     bool operator==(const Adjustment& o) const {
-        return kind == o.kind && a == o.a && b == o.b && c == o.c && d == o.d && e == o.e && stops == o.stops && raw == o.raw &&
+        return kind == o.kind && a == o.a && b == o.b && c == o.c && d == o.d && e == o.e && stops == o.stops && curve == o.curve &&
+               std::equal(balance, balance + 9, o.balance) && preserveLuminosity == o.preserveLuminosity && raw == o.raw &&
                lut[0] == o.lut[0] && lut[1] == o.lut[1] && lut[2] == o.lut[2] && lutAlpha == o.lutAlpha;
     }
     static Adjustment make(Kind k);  // default settings for a new correction layer

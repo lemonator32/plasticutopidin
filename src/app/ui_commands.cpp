@@ -49,7 +49,7 @@ void applyTheme() {
 
 void exec(int cmd) {
     AppState& s = g.state;
-    if (cmd > CmdAdjustBase && cmd <= CmdAdjustBase + static_cast<int>(Adjustment::Kind::GradientMap)) {
+    if (cmd > CmdAdjustBase && cmd < CmdAdjustBase + static_cast<int>(Adjustment::Kind::Count)) {
         s.addAdjustmentLayer(static_cast<Adjustment::Kind>(cmd - CmdAdjustBase));
         contentChanged();
         defer(layerSettingsDialog);

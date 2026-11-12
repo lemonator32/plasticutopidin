@@ -162,21 +162,16 @@ void identityLuts(Adjustment& a) {
     }
 }
 
-// Applies a 0..65535 curve given as sorted (in, out) control points to `t`,
-// piecewise-linearly (CSP's curves are splines; close for gentle curves).
-void applyCurve(std::vector<uint8_t>& t, const std::vector<std::pair<int, int>>& pts) {
-    if (pts.size() < 2) return;
-    std::vector<uint8_t> src = t;
-    for (int i = 0; i < 256; ++i) {
-        int v = src[i] * 257;
-        size_t k = 1;
-        while (k + 1 < pts.size() && pts[k].first < v) ++k;
-        auto [x0, y0] = pts[k - 1];
-        auto [x1, y1] = pts[k];
-        double f = x1 > x0 ? std::clamp(double(v - x0) / (x1 - x0), 0.0, 1.0) : 0.0;
-        double out = y0 + (y1 - y0) * f;
-        t[i] = static_cast<uint8_t>(std::clamp(out / 257.0 + 0.5, 0.0, 255.0));
-    }
+// A file's 0..65535 curve as the engine's 0..255 control points.
+CurvePoints curve8(const std::vector<std::pair<int, int>>& pts) {
+    CurvePoints out;
+    for (auto [x, y] : pts) out.push_back({(x + 128) / 257, (y + 128) / 257});
+    return out;
+}
+bool isIdentityCurve(const CurvePoints& c) {
+    for (auto [x, y] : c)
+        if (x != y) return false;
+    return true;
 }
 
 // Applies one Levels record (u16 in black, gamma point, in white, out black,
@@ -272,12 +267,18 @@ bool readFilter(const clip_layer_info& li, Adjustment& adj) {
                 for (int i = 0; i < count; ++i) pts.push_back({be16(c + 2 + 4 * i), be16(c + 4 + 4 * i)});
                 return pts;
             };
-            auto master = read(0);
+            adj.curve = curve8(read(0));
+            bool perChannel = false;
             for (int c = 0; c < 3; ++c) {
-                applyCurve(adj.lut[c], master);
-                applyCurve(adj.lut[c], read(c + 1));
+                CurvePoints ch = curve8(read(c + 1));
+                perChannel = perChannel || !isIdentityCurve(ch);
+                applyCurve(adj.lut[c], adj.curve);
+                applyCurve(adj.lut[c], ch);
             }
-            adj.raw.assign(b, b + 8 + size);
+            // Only per-channel curves need the file's tables; a master-only
+            // curve is rebuilt from its points (and editable) like any other.
+            if (perChannel) adj.raw.assign(b, b + 8 + size);
+            else adj.rebuild();
             return true;
         }
         case CLIP_FILTER_COLOR_BALANCE: {
@@ -285,20 +286,22 @@ bool readFilter(const clip_layer_info& li, Adjustment& adj) {
             // (cyan-red, magenta-green, yellow-blue), each -100..100.
             if (size < 40) return false;
             adj.kind = Adjustment::Kind::ColorBalance;
-            identityLuts(adj);
-            for (int c = 0; c < 3; ++c)
-                for (int i = 0; i < 256; ++i) {
-                    double v = i / 255.0;
-                    double ws = std::clamp(1.0 - v * 3.0, 0.0, 1.0);  // shadows
-                    double wh = std::clamp(v * 3.0 - 2.0, 0.0, 1.0);  // highlights
-                    double wm = 1.0 - ws - wh;                         // midtones
-                    double shift = (sbe32(p + 4 + 4 * c) * ws + sbe32(p + 16 + 4 * c) * wm + sbe32(p + 28 + 4 * c) * wh) / 100.0;
-                    adj.lut[c][i] = static_cast<uint8_t>(
-                        std::clamp((v + shift * 0.4 * (1 - std::abs(2 * v - 1)) + shift * 0.1) * 255.0 + 0.5, 0.0, 255.0));
-                }
-            adj.raw.assign(b, b + 8 + size);
-            return true;
+            adj.preserveLuminosity = sbe32(p) != 0;
+            for (int i = 0; i < 9; ++i) adj.balance[i] = sbe32(p + 4 + 4 * i);
+            break;
         }
+        case CLIP_FILTER_POSTERIZE:
+            // Not seen in the surveyed files; assumed i32 level count.
+            if (size < 4) return false;
+            adj.kind = Adjustment::Kind::Posterize;
+            adj.a = std::clamp(sbe32(p), 2, 256);
+            break;
+        case CLIP_FILTER_BINARIZE:
+            // Not seen in the surveyed files; assumed i32 threshold 0..255.
+            if (size < 4) return false;
+            adj.kind = Adjustment::Kind::Binarize;
+            adj.a = std::clamp(sbe32(p), 0, 255);
+            break;
         case CLIP_FILTER_GRADIENT_MAP: {
             // u32 size, then the stop table shared with gradient layers.
             clip_gradient gr{};
@@ -355,7 +358,40 @@ std::vector<uint8_t> writeFilter(const Adjustment& a) {
             clip_buffer_free(&t);
             break;
         }
-        default: return {};  // tone curve / colour balance always keep `raw`
+        case Adjustment::Kind::ToneCurve: {
+            // 32 curves as CSP writes them: the master from the points, the
+            // others (R, G, B and the rest) straight lines.
+            kind = CLIP_FILTER_TONE_CURVE;
+            CurvePoints pts = a.curve;
+            std::stable_sort(pts.begin(), pts.end(), [](auto& p, auto& q) { return p.first < q.first; });
+            if (pts.size() < 2) pts = {{0, 0}, {255, 255}};
+            if (pts.size() > 32) pts.resize(32);
+            for (int k = 0; k < 32; ++k) {
+                const CurvePoints line = {{0, 0}, {255, 255}};
+                const CurvePoints& c = k == 0 ? pts : line;
+                put16(params, static_cast<uint16_t>(c.size()));
+                for (size_t i = 0; i < 32; ++i) {
+                    int x = i < c.size() ? c[i].first : 0, y = i < c.size() ? c[i].second : 0;
+                    put16(params, static_cast<uint16_t>(std::clamp(x, 0, 255) * 257));
+                    put16(params, static_cast<uint16_t>(std::clamp(y, 0, 255) * 257));
+                }
+            }
+            break;
+        }
+        case Adjustment::Kind::ColorBalance:
+            kind = CLIP_FILTER_COLOR_BALANCE;
+            put32(params, a.preserveLuminosity ? 1u : 0u);
+            for (int v : a.balance) put32(params, static_cast<uint32_t>(std::clamp(v, -100, 100)));
+            break;
+        case Adjustment::Kind::Posterize:
+            kind = CLIP_FILTER_POSTERIZE;
+            put32(params, static_cast<uint32_t>(std::clamp(a.a, 2, 256)));
+            break;
+        case Adjustment::Kind::Binarize:
+            kind = CLIP_FILTER_BINARIZE;
+            put32(params, static_cast<uint32_t>(std::clamp(a.a, 0, 255)));
+            break;
+        default: return {};
     }
     std::vector<uint8_t> out;
     put32(out, kind);
@@ -378,6 +414,9 @@ bool readGradation(const clip_layer_info& li, Layer& l) {
     }
     l.kind = LayerKind::Gradient;
     l.gradient.shape = GradientFill::Shape::Linear;
+    // GradationSetting repeat: 0 none; 1 and 2 are assumed to be repeat and
+    // flip (only 0 occurs in the surveyed files).
+    l.gradient.repeat = gr.repeat == 1 ? GradientFill::Repeat::Repeat : gr.repeat == 2 ? GradientFill::Repeat::Flip : GradientFill::Repeat::None;
     l.gradient.stops = toStops(gr);
     // The end points are relative to the layer's position.
     l.gradient.x0 = static_cast<float>(gr.x0 + li.offset_x);
@@ -403,6 +442,7 @@ bool writeGradation(const Layer& l, clip_gradient& g) {
     }
     if (l.kind != LayerKind::Gradient || l.gradient.shape != GradientFill::Shape::Linear) return false;
     fromStops(l.gradient.stops, g);
+    g.repeat = l.gradient.repeat == GradientFill::Repeat::Repeat ? 1 : l.gradient.repeat == GradientFill::Repeat::Flip ? 2 : 0;
     g.x0 = l.gradient.x0;
     g.y0 = l.gradient.y0;
     g.x1 = l.gradient.x1;

@@ -194,6 +194,9 @@ const char* Adjustment::kindName(Kind k) {
         case Kind::ColorBalance: return "Color balance";
         case Kind::Invert: return "Reverse gradient";
         case Kind::GradientMap: return "Gradient map";
+        case Kind::Posterize: return "Posterization";
+        case Kind::Binarize: return "Binarization";
+        case Kind::Count: break;
     }
     return "?";
 }
@@ -204,11 +207,70 @@ Adjustment Adjustment::make(Kind k) {
     switch (k) {
         case Kind::Levels: a.a = 0; a.b = 128; a.c = 255; a.d = 0; a.e = 255; break;
         case Kind::GradientMap: a.stops = {{0.f, Color::rgba(0, 0, 0)}, {1.f, Color::rgba(255, 255, 255)}}; break;
+        case Kind::ToneCurve: a.curve = {{0, 0}, {255, 255}}; break;
+        case Kind::Posterize: a.a = 4; break;
+        case Kind::Binarize: a.a = 128; break;
         default: break;
     }
     a.rebuild();
     return a;
 }
+
+// Monotone cubic interpolation (Fritsch-Carlson) through sorted points: a
+// smooth curve that never overshoots between control points.
+void applyCurve(std::vector<uint8_t>& table, const CurvePoints& points) {
+    if (table.size() != 256) identity(table);
+    CurvePoints p = points;
+    std::stable_sort(p.begin(), p.end(), [](auto& x, auto& y) { return x.first < y.first; });
+    p.erase(std::unique(p.begin(), p.end(), [](auto& x, auto& y) { return x.first == y.first; }), p.end());
+    const size_t n = p.size();
+    if (n < 2) return;
+    std::vector<double> xs(n), ys(n), d(n - 1), m(n);
+    for (size_t i = 0; i < n; ++i) { xs[i] = p[i].first; ys[i] = p[i].second; }
+    for (size_t i = 0; i + 1 < n; ++i) d[i] = (ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]);
+    m[0] = d[0];
+    m[n - 1] = d[n - 2];
+    for (size_t i = 1; i + 1 < n; ++i) m[i] = d[i - 1] * d[i] <= 0 ? 0.0 : (d[i - 1] + d[i]) / 2;
+    for (size_t i = 0; i + 1 < n; ++i) {
+        if (d[i] == 0) { m[i] = m[i + 1] = 0; continue; }
+        double a = m[i] / d[i], b = m[i + 1] / d[i], s = a * a + b * b;
+        if (s > 9) { double t = 3 / std::sqrt(s); m[i] = t * a * d[i]; m[i + 1] = t * b * d[i]; }
+    }
+    auto eval = [&](double x) {
+        if (x <= xs[0]) return ys[0];
+        if (x >= xs[n - 1]) return ys[n - 1];
+        size_t k = 0;
+        while (k + 2 < n && x > xs[k + 1]) ++k;
+        double h = xs[k + 1] - xs[k], t = (x - xs[k]) / h, t2 = t * t, t3 = t2 * t;
+        return (2 * t3 - 3 * t2 + 1) * ys[k] + (t3 - 2 * t2 + t) * h * m[k] + (-2 * t3 + 3 * t2) * ys[k + 1] + (t3 - t2) * h * m[k + 1];
+    };
+    std::vector<uint8_t> src = table;
+    for (int i = 0; i < 256; ++i) table[i] = static_cast<uint8_t>(std::clamp(eval(src[i]) + 0.5, 0.0, 255.0));
+}
+
+namespace {
+
+// One channel of a colour balance: how far (-100..100) the shadows, midtones
+// and highlights move towards (positive) or away from the channel.
+void applyBalance(std::vector<uint8_t>& t, int shadow, int mid, int high) {
+    if (t.size() != 256) identity(t);
+    for (int i = 0; i < 256; ++i) {
+        double v = t[i] / 255.0;
+        // Smooth weights that sum to one: shadows fade out by mid grey,
+        // highlights fade in from it, midtones take the rest.
+        double ws = std::clamp(1.0 - v * 2.0, 0.0, 1.0), wh = std::clamp(v * 2.0 - 1.0, 0.0, 1.0);
+        ws = ws * ws * (3 - 2 * ws);
+        wh = wh * wh * (3 - 2 * wh);
+        double wm = 1.0 - ws - wh;
+        double shift = (shadow * ws + mid * wm + high * wh) / 100.0;
+        // Full strength around mid grey, less near black and white so the
+        // ends stay put, as a balance does.
+        double room = 1.0 - std::abs(2 * v - 1);
+        t[i] = static_cast<uint8_t>(std::clamp((v + shift * (0.1 + 0.4 * room)) * 255.0 + 0.5, 0.0, 255.0));
+    }
+}
+
+}  // namespace
 
 void Adjustment::rebuild() {
     switch (kind) {
@@ -239,18 +301,65 @@ void Adjustment::rebuild() {
             break;
         }
         case Kind::ToneCurve:
-        case Kind::ColorBalance:
-            for (auto& t : lut)
-                if (t.size() != 256) identity(t);
+            // The file's per-channel curves stay in `lut` until the curve is
+            // edited (then `raw` is empty and the master curve is all there is).
+            if (!raw.empty()) {
+                for (auto& t : lut)
+                    if (t.size() != 256) identity(t);
+                break;
+            }
+            for (auto& t : lut) {
+                identity(t);
+                applyCurve(t, curve);
+            }
             break;
+        case Kind::ColorBalance:
+            for (int ch = 0; ch < 3; ++ch) {
+                identity(lut[ch]);
+                applyBalance(lut[ch], balance[ch], balance[3 + ch], balance[6 + ch]);
+            }
+            break;
+        case Kind::Posterize: {
+            // `a` levels per channel, evenly spaced from 0 to 255.
+            const int n = std::clamp(a, 2, 256);
+            for (auto& t : lut) t.resize(256);
+            for (int i = 0; i < 256; ++i) {
+                int step = std::min(n - 1, i * n / 256);
+                lut[0][i] = lut[1][i] = lut[2][i] = static_cast<uint8_t>(step * 255 / (n - 1));
+            }
+            break;
+        }
         default: break;
     }
 }
+
+namespace {
+
+// Luminance preserved: scale the colour so its luma is back to the original.
+Color keepLuma(Color px, Color out) {
+    int y0 = (px.r * 299 + px.g * 587 + px.b * 114 + 500) / 1000;
+    int y1 = (out.r * 299 + out.g * 587 + out.b * 114 + 500) / 1000;
+    int d = y0 - y1;
+    auto f = [d](uint8_t v) { return static_cast<uint8_t>(std::clamp(v + d, 0, 255)); };
+    return Color::rgba(f(out.r), f(out.g), f(out.b), px.a);
+}
+
+}  // namespace
 
 Color Adjustment::apply(Color px) const {
     switch (kind) {
         case Kind::None: return px;
         case Kind::Invert: return Color::rgba(255 - px.r, 255 - px.g, 255 - px.b, px.a);
+        case Kind::Binarize: {
+            int y = (px.r * 299 + px.g * 587 + px.b * 114 + 500) / 1000;
+            uint8_t v = y >= a ? 255 : 0;
+            return Color::rgba(v, v, v, px.a);
+        }
+        case Kind::ColorBalance: {
+            if (lut[0].size() < 256 || lut[1].size() < 256 || lut[2].size() < 256) return px;
+            Color out = Color::rgba(lut[0][px.r], lut[1][px.g], lut[2][px.b], px.a);
+            return preserveLuminosity ? keepLuma(px, out) : out;
+        }
         case Kind::BrightnessContrast: {
             // Brightness shifts by up to +-50%; contrast scales around the midpoint.
             float br = a / 200.f;
@@ -303,6 +412,12 @@ void renderGradient(const GradientFill& g, Rect clip, Surface& out) {
             if (len2 <= 0.f) t = 0.f;
             else if (g.shape == GradientFill::Shape::Radial) t = std::sqrt(px * px + py * py) / len;
             else t = (px * dx + py * dy) / len2;
+            if (g.repeat == GradientFill::Repeat::Repeat) {
+                t -= std::floor(t);
+            } else if (g.repeat == GradientFill::Repeat::Flip) {
+                t = std::fabs(t - 2.f * std::floor(t / 2.f) - 1.f);  // triangle wave: 0..1..0 over 0..2
+                t = 1.f - t;
+            }
             o[x] = table[static_cast<size_t>(std::clamp(t, 0.f, 1.f) * 1023.f + 0.5f)];
         }
     }
