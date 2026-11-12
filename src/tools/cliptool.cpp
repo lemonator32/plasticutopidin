@@ -100,10 +100,29 @@ static int cmdInfo(const char* path) {
     std::printf("layers (top to bottom):\n");
     for (size_t i = 0; i < clip_document_layer_count(doc.get()); ++i) {
         const clip_layer_info& l = *clip_document_layer(doc.get(), i);
-        std::printf("  #%-3d %*s%s%-28s type=0x%x(%s) opacity=%3d%% blend=%s %s%s%s mipmap=%lld\n", (int)i, l.depth * 2, "",
+        std::printf("  #%-3d %*s%s%-28s type=0x%x(%s) opacity=%3d%% blend=%s %s%s%s mipmap=%lld", (int)i, l.depth * 2, "",
                     clip_layer_is_folder(&l) ? "[+] " : "", l.name, l.type, clip_layer_type_name(l.type), l.opacity * 100 / 256,
                     blendModeName(blendModeFromComposite(l.composite)), l.visible ? "" : "hidden ", l.locked ? "locked " : "",
                     l.clip ? "clip " : "", (long long)l.render_mipmap);
+        if (l.mask_mipmap && (l.type & 0x2)) std::printf(" mask=%s", clip_layer_mask_enabled(&l) ? "on" : "off");
+        if (clip_layer_is_filter(&l)) {
+            const uint8_t* b = l.filter_info;
+            uint32_t kind = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 8 | b[3];
+            uint32_t size = uint32_t(b[4]) << 24 | uint32_t(b[5]) << 16 | uint32_t(b[6]) << 8 | b[7];
+            std::printf(" filter=%u(%u bytes", kind, size);
+            for (size_t k = 8; k < l.filter_info_size && k < 8 + std::min<size_t>(size, 16); ++k) std::printf(" %02x", b[k]);
+            std::printf(")");
+        }
+        if (l.gradation_info) {
+            clip_gradient gr{};
+            if (clip_gradation_parse(l.gradation_info, l.gradation_info_size, &gr, nullptr))
+                std::printf(" gradient=%s shape=%d repeat=%d aa=%d ellipse=%.0f/%.0f/%.0f stops=%zu (%.0f,%.0f)-(%.0f,%.0f)",
+                            gr.fill ? "fill" : "stops", gr.shape, gr.repeat, gr.antialias, gr.ellipse[0], gr.ellipse[1], gr.ellipse[2],
+                            gr.stop_count, gr.x0, gr.y0, gr.x1, gr.y1);
+            else
+                std::printf(" gradient=unparsed");
+        }
+        std::printf("\n");
     }
     return 0;
 }
