@@ -172,9 +172,38 @@ public:
     void mergeDown();
     void mergeVisible();
 
+    // Folders (undoable).  New layers go above the active layer, or inside it
+    // (at the top) when it is a folder.
+    void addFolder();
+    void groupIntoFolder();                     // puts the active layer (or folder) into a new folder
+    void moveBlockTo(size_t from, size_t at, int depth);  // drag and drop: see the .cpp
+    void toggleExpanded(size_t index);          // show/hide a folder's layers in the palette (not undoable)
+    void togglePassThrough();
+
+    // New non-raster layers above the active one (undoable).
+    void addFillLayer(Color c);
+    void addGradientLayer();                    // main -> sub colour, top to bottom
+    void addAdjustmentLayer(Adjustment::Kind k);
+    // Settings of the active Fill / Gradient / Correction layer (undoable;
+    // folded into a property edit when one is open).
+    void setFillColor(Color c);
+    void setGradient(const GradientFill& g);
+    void setAdjustment(Adjustment a);           // rebuilds its tables and drops the stored file parameters
+    // Turns the active Fill / Gradient layer into a raster layer (keeps its mask).
+    void rasterizeLayer();
+
+    // Layer masks on the active layer (undoable).  addMask masks outside the
+    // selection when there is one, else creates a mask that shows everything.
+    void addMask();
+    void deleteMask();
+    void applyMask();                           // raster layers: bake the mask into the pixels
+    void toggleMaskEnabled();
+    void setEditMask(bool on);                  // pixel tools paint the mask (UI state)
+
     // Live property edits (e.g. dragging the opacity slider) become one undo step.
     void beginPropertyEdit();
     void endPropertyEdit();
+    void cancelPropertyEdit();  // restores the layer as it was at beginPropertyEdit
 
     // Pixel operations on the active layer.
     void flipLayer(bool horizontal);
@@ -186,6 +215,12 @@ public:
 private:
     void pushProps(Layer& l, const LayerPropertyCommand::Props& before);
     bool editableLayer(Layer*& l);
+    // editableLayer + something pixel tools can change (raster pixels or a mask).
+    bool paintableLayer(Layer*& l);
+    void insertNewLayer(std::unique_ptr<Layer> l, const char* status);
+    std::pair<size_t, int> insertionPoint() const;  // index and depth for a new layer
+    std::string nextName(const std::string& base) const;
+    bool strokeMask_ = false;
     void replaceLayerPixels(Layer& l, Surface after, const char* label, bool masked = true);
     void applyAlphaLock(Rect r);
     void setSelection(std::vector<uint8_t> shape, SelectMode mode, const char* label);

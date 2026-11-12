@@ -50,7 +50,8 @@ void pickColor(int x, int y, bool layerOnly) {
     if (layerOnly) {
         Layer* l = g.state.active();
         if (!l) return;
-        c = l->surface.at(px, py);
+        // The layer's displayed colour (a generated layer has no pixels of its own).
+        c = l->isRaster() ? l->surface.at(px, py) : g.state.doc.renderLayer(*l, Rect{px, py, 1, 1}).at(0, 0);
         if (c.a == 0) return;
     } else {
         c = g.composite.at(px, py);
@@ -88,7 +89,7 @@ void canvasPress(int x, int y, float pressure, int button) {
             SubTool& st = g.state.sub();
             Layer* l = g.state.active();
             if (!l) return;
-            const Surface& ref = k == SubKind::FillRefAll ? g.composite : l->surface;
+            const Surface& ref = k == SubKind::FillRefAll || !l->isRaster() ? g.composite : l->paintTarget();
             Rect r = g.state.floodFill(static_cast<int>(std::floor(cx)), static_cast<int>(std::floor(cy)), ref, st.tolerance, st.expand,
                                        g.state.drawColor(), g.state.colorSlot == ColorSlot::Transparent);
             if (!r.empty()) contentChanged();

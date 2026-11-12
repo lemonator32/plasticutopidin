@@ -27,6 +27,17 @@ enum class BlendMode : uint8_t {
     Saturation,
     Color,
     Luminosity,
+    // Clip Studio Paint modes beyond the W3C set (appended so earlier values keep their numbers).
+    LinearBurn,
+    DarkerColor,
+    LighterColor,
+    GlowDodge,
+    AddGlow,
+    VividLight,
+    LinearLight,
+    PinLight,
+    HardMix,
+    Divide,
     Count
 };
 

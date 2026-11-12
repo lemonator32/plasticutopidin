@@ -11,7 +11,7 @@ std::string fileDialog(bool save, bool pngOnly) {
     ofn.hwndOwner = g.hwnd;
     ofn.lpstrFilter = pngOnly ? L"PNG (*.png)\0*.png\0"
                       : save ? L"CLIP STUDIO FORMAT (*.clip)\0*.clip\0PNG (*.png)\0*.png\0"
-                             : L"Images (*.clip;*.png)\0*.clip;*.png\0CLIP STUDIO FORMAT (*.clip)\0*.clip\0PNG (*.png)\0*.png\0All files\0*.*\0";
+                             : L"Images (*.clip;*.lip;*.png)\0*.clip;*.lip;*.png\0CLIP STUDIO FORMAT (*.clip;*.lip)\0*.clip;*.lip\0PNG (*.png)\0*.png\0All files\0*.*\0";
     ofn.lpstrFile = buf;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = save ? (OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST) : (OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST);
@@ -60,36 +60,7 @@ void doOpen(const std::string& path) {
     documentReplaced();
 }
 
-// New canvas dialog, built from an in-memory template.
-struct DlgBuilder {
-    std::vector<WORD> buf;
-    void align() { if (buf.size() % 2) buf.push_back(0); }
-    void dw(DWORD v) { buf.push_back(LOWORD(v)); buf.push_back(HIWORD(v)); }
-    void str(const wchar_t* s) { while (*s) buf.push_back(*s++); buf.push_back(0); }
-    void begin(const wchar_t* title, short w, short h, WORD count) {
-        dw(DS_MODALFRAME | DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU);
-        dw(0);
-        buf.push_back(count);
-        buf.push_back(0); buf.push_back(0); buf.push_back(static_cast<WORD>(w)); buf.push_back(static_cast<WORD>(h));
-        buf.push_back(0);  // menu
-        buf.push_back(0);  // class
-        str(title);
-        buf.push_back(9);
-        str(L"Segoe UI");
-    }
-    void item(DWORD style, short x, short y, short w, short h, WORD id, WORD cls, const wchar_t* t) {
-        align();
-        dw(style | WS_CHILD | WS_VISIBLE);
-        dw(0);
-        buf.push_back(static_cast<WORD>(x)); buf.push_back(static_cast<WORD>(y)); buf.push_back(static_cast<WORD>(w)); buf.push_back(static_cast<WORD>(h));
-        buf.push_back(id);
-        buf.push_back(0xFFFF);
-        buf.push_back(cls);
-        str(t);
-        buf.push_back(0);
-    }
-};
-
+// New canvas dialog, built from an in-memory template (DlgBuilder, ui.h).
 struct NewCanvas {
     int w = 1200, h = 900, dpi = 350;
 };

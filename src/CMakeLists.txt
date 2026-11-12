@@ -59,7 +59,7 @@ add_test(NAME unit COMMAND pu_tests)
 if(WIN32)
   add_executable(plastic_paint WIN32
     app/main_win32.cpp app/ui_base.cpp app/ui_palettes.cpp app/ui_canvas.cpp app/ui_files.cpp
-    app/ui_menus.cpp app/ui_tools.cpp app/ui_commands.cpp
+    app/ui_menus.cpp app/ui_tools.cpp app/ui_commands.cpp app/ui_layer_settings.cpp
     app/app_state.cpp app/ui_icons.cpp)
-  target_link_libraries(plastic_paint PRIVATE pu_clip user32 gdi32 gdiplus comdlg32 shell32 dwmapi)
+  target_link_libraries(plastic_paint PRIVATE pu_clip user32 gdi32 gdiplus comdlg32 comctl32 shell32 dwmapi)
 endif()

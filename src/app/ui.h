@@ -71,13 +71,18 @@ enum Cmd : int {
     CmdHideAll, CmdCommandBar, CmdThemeDark, CmdThemeLight,
     CmdShortcuts, CmdAbout,
     CmdSelectAll, CmdDeselect, CmdInvertSelection, CmdClearOutside, CmdLayerProperty,
+    CmdLayerNewFill, CmdLayerNewGradient, CmdLayerSettings, CmdLayerRasterize,
+    CmdMaskAdd, CmdMaskDelete, CmdMaskApply, CmdMaskEnable, CmdMaskEdit,
     CmdPalBase = 300,    // + Pal
     CmdBlendBase = 400,  // + BlendMode
+    CmdAdjustBase = 500, // + Adjustment::Kind: new correction layer
 };
 
 inline const wchar_t* const kBlendNames[] = {L"Normal",     L"Multiply",   L"Screen",     L"Overlay",    L"Darken",     L"Lighten",
                                       L"Color dodge", L"Color burn", L"Hard light", L"Soft light", L"Difference", L"Exclusion",
-                                      L"Add",        L"Subtract",   L"Hue",        L"Saturation", L"Color",      L"Brightness"};
+                                      L"Add",        L"Subtract",   L"Hue",        L"Saturation", L"Color",      L"Brightness",
+                                      L"Linear burn", L"Darker color", L"Lighter color", L"Glow dodge", L"Add (Glow)", L"Vivid light",
+                                      L"Linear light", L"Pin light", L"Hard mix",   L"Divide"};
 static_assert(sizeof(kBlendNames) / sizeof(kBlendNames[0]) == static_cast<size_t>(BlendMode::Count));
 
 // ---- hits -------------------------------------------------------------------------
@@ -189,6 +194,7 @@ struct App {
 
     // Menus
     HMENU menus[8]{};  // indexed by Menu
+    HMENU maskMenu{};  // Layer > Layer mask
     std::vector<RECT> menuTitles;
     int menuOpen = -1, menuNext = -1;
     HHOOK menuHook = nullptr;
@@ -237,6 +243,7 @@ extern RECT g_renameRect;
 
 // ---- functions, in definition order --------------------------------------------
 std::wstring widen(const std::string& s);
+bool pickColorDialog(Color& c);  // the system colour dialog; false when cancelled
 std::string narrow(const std::wstring& w);
 std::wstring fmt(const wchar_t* f, double v);
 std::wstring baseName(const std::string& path);
@@ -332,6 +339,51 @@ bool confirmDiscard();
 void doOpen(const std::string& path);
 INT_PTR CALLBACK newDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp);
 void doNew();
+// A dialog template built in memory (for DialogBoxIndirectParamW).
+struct DlgBuilder {
+    std::vector<WORD> buf;
+    void align() { if (buf.size() % 2) buf.push_back(0); }
+    void dw(DWORD v) { buf.push_back(LOWORD(v)); buf.push_back(HIWORD(v)); }
+    void str(const wchar_t* s) { while (*s) buf.push_back(*s++); buf.push_back(0); }
+    void begin(const wchar_t* title, short w, short h, WORD count) {
+        dw(DS_MODALFRAME | DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU);
+        dw(0);
+        buf.push_back(count);
+        buf.push_back(0); buf.push_back(0); buf.push_back(static_cast<WORD>(w)); buf.push_back(static_cast<WORD>(h));
+        buf.push_back(0);  // menu
+        buf.push_back(0);  // class
+        str(title);
+        buf.push_back(9);
+        str(L"Segoe UI");
+    }
+    void item(DWORD style, short x, short y, short w, short h, WORD id, WORD cls, const wchar_t* t) {
+        align();
+        dw(style | WS_CHILD | WS_VISIBLE);
+        dw(0);
+        buf.push_back(static_cast<WORD>(x)); buf.push_back(static_cast<WORD>(y)); buf.push_back(static_cast<WORD>(w)); buf.push_back(static_cast<WORD>(h));
+        buf.push_back(id);
+        buf.push_back(0xFFFF);
+        buf.push_back(cls);
+        str(t);
+        buf.push_back(0);
+    }
+    // A control of a registered window class given by name (e.g. a trackbar).
+    void item(DWORD style, short x, short y, short w, short h, WORD id, const wchar_t* cls, const wchar_t* t) {
+        align();
+        dw(style | WS_CHILD | WS_VISIBLE);
+        dw(0);
+        buf.push_back(static_cast<WORD>(x)); buf.push_back(static_cast<WORD>(y)); buf.push_back(static_cast<WORD>(w)); buf.push_back(static_cast<WORD>(h));
+        buf.push_back(id);
+        str(cls);
+        str(t);
+        buf.push_back(0);
+    }
+    static constexpr WORD Button = 0x0080, Edit = 0x0081, Static = 0x0082, ListBox = 0x0083, ComboBox = 0x0085;
+};
+// Settings of the active Fill / Gradient / Correction layer, applied live.
+void layerSettingsDialog();
+// Adds the "New correction layer" kinds to a menu (commands CmdAdjustBase + kind).
+void appendCorrectionMenu(HMENU m);
 LRESULT CALLBACK editWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 void startRename();
 void commitRename(bool apply);

@@ -49,6 +49,12 @@ void applyTheme() {
 
 void exec(int cmd) {
     AppState& s = g.state;
+    if (cmd > CmdAdjustBase && cmd <= CmdAdjustBase + static_cast<int>(Adjustment::Kind::GradientMap)) {
+        s.addAdjustmentLayer(static_cast<Adjustment::Kind>(cmd - CmdAdjustBase));
+        contentChanged();
+        defer(layerSettingsDialog);
+        return;
+    }
     if (cmd >= CmdBlendBase && cmd < CmdBlendBase + static_cast<int>(BlendMode::Count)) {
         s.setBlendMode(static_cast<BlendMode>(cmd - CmdBlendBase));
         contentChanged();
@@ -117,6 +123,22 @@ void exec(int cmd) {
         case CmdFlipLayerH: s.flipLayer(true); contentChanged(); break;
         case CmdFlipLayerV: s.flipLayer(false); contentChanged(); break;
         case CmdLayerNew: layerOp(&AppState::addLayer); break;
+        case CmdLayerNewFill: {
+            Color c = s.mainColor;
+            if (pickColorDialog(c)) { s.addFillLayer(c); contentChanged(); }
+            break;
+        }
+        case CmdLayerNewGradient: layerOp(&AppState::addGradientLayer); break;
+        case CmdLayerSettings: defer(layerSettingsDialog); break;
+        case CmdLayerRasterize: layerOp(&AppState::rasterizeLayer); break;
+        case CmdMaskAdd: layerOp(&AppState::addMask); break;
+        case CmdMaskDelete: layerOp(&AppState::deleteMask); break;
+        case CmdMaskApply: layerOp(&AppState::applyMask); break;
+        case CmdMaskEnable: layerOp(&AppState::toggleMaskEnabled); break;
+        case CmdMaskEdit:
+            if (Layer* l = s.active()) s.setEditMask(!l->paintsMask());
+            invalidateAll();
+            break;
         case CmdLayerDup: layerOp(&AppState::duplicateLayer); break;
         case CmdLayerDelete: layerOp(&AppState::deleteLayer); break;
         case CmdLayerRename: defer(startRename); break;
@@ -213,6 +235,7 @@ bool onKey(WPARAM vk, bool repeat) {
             case 'Y': exec(CmdRedo); return true;
             case 'I': exec(shift ? CmdInvertSelection : CmdInvert); return true;
             case 'A': exec(CmdSelectAll); return true;
+            case 'M': exec(CmdMaskEdit); return true;
             case 'D': exec(CmdDeselect); return true;
             case 'E': exec(shift ? CmdLayerMergeVisible : CmdLayerMerge); return true;
             case '0': exec(CmdZoomFit); return true;

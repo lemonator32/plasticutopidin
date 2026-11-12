@@ -704,6 +704,11 @@ void layerContextMenu() {
     HMENU m = CreatePopupMenu();
     Layer* l = g.state.active();
     AppendMenuW(m, MF_STRING, CmdLayerNew, L"New raster layer\tCtrl+Shift+N");
+    AppendMenuW(m, MF_STRING, CmdLayerNewFill, L"New fill layer...");
+    AppendMenuW(m, MF_STRING, CmdLayerNewGradient, L"New gradient layer");
+    HMENU corr = CreatePopupMenu();
+    appendCorrectionMenu(corr);
+    AppendMenuW(m, MF_POPUP, reinterpret_cast<UINT_PTR>(corr), L"New correction layer");
     AppendMenuW(m, MF_STRING, CmdLayerDup, L"Duplicate layer");
     AppendMenuW(m, MF_STRING, CmdLayerDelete, L"Delete layer");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -711,6 +716,17 @@ void layerContextMenu() {
     AppendMenuW(m, MF_STRING | (l && l->clipToBelow ? MF_CHECKED : 0), CmdLayerClip, L"Clip at layer below\tCtrl+Alt+G");
     AppendMenuW(m, MF_STRING | (l && l->locked ? MF_CHECKED : 0), CmdLayerLock, L"Lock layer");
     AppendMenuW(m, MF_STRING | (l && l->lockAlpha ? MF_CHECKED : 0), CmdLayerLockAlpha, L"Lock transparent pixels");
+    if (l && !l->isRaster()) AppendMenuW(m, MF_STRING, CmdLayerSettings, L"Layer settings...");
+    if (l && (l->kind == LayerKind::Fill || l->kind == LayerKind::Gradient)) AppendMenuW(m, MF_STRING, CmdLayerRasterize, L"Rasterize");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    if (l && !l->hasMask()) {
+        AppendMenuW(m, MF_STRING, CmdMaskAdd, L"Create layer mask");
+    } else if (l) {
+        AppendMenuW(m, MF_STRING | (l->paintsMask() ? MF_CHECKED : 0), CmdMaskEdit, L"Edit layer mask\tCtrl+M");
+        AppendMenuW(m, MF_STRING | (l->maskEnabled ? MF_CHECKED : 0), CmdMaskEnable, L"Enable mask");
+        if (l->isRaster()) AppendMenuW(m, MF_STRING, CmdMaskApply, L"Apply mask to layer");
+        AppendMenuW(m, MF_STRING, CmdMaskDelete, L"Delete layer mask");
+    }
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, CmdLayerMerge, L"Merge with layer below\tCtrl+E");
     AppendMenuW(m, MF_STRING, CmdLayerMergeVisible, L"Merge visible layers\tCtrl+Shift+E");
@@ -725,6 +741,56 @@ void layerContextMenu() {
 }
 
 RECT g_renameRect{};
+
+namespace {
+
+// A small stand-in for a layer's content to make its thumbnail from: raster
+// layers use their pixels; the others are generated at thumbnail size.
+Surface layerPreview(const Document& doc, const Layer& l, int w, int h) {
+    switch (l.kind) {
+        case LayerKind::Raster: return l.surface;
+        case LayerKind::Fill: return Surface(w, h, l.fillColor);
+        case LayerKind::Gradient: {
+            Document tiny(w, h);
+            Layer t;
+            t.kind = LayerKind::Gradient;
+            t.gradient = l.gradient;
+            float sx = static_cast<float>(w) / std::max(1, doc.width()), sy = static_cast<float>(h) / std::max(1, doc.height());
+            t.gradient.x0 *= sx; t.gradient.x1 *= sx;
+            t.gradient.y0 *= sy; t.gradient.y1 *= sy;
+            return tiny.renderLayer(t, tiny.bounds());
+        }
+        case LayerKind::Adjustment: {
+            // A hue (across) by lightness (down) chart, corrected: shows what the layer does.
+            Surface s(w, h);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    float hue = 6.f * x / w, v = 1.f - static_cast<float>(y) / std::max(1, h - 1);
+                    auto ch = [&](float off) {
+                        float k = std::fmod(hue + off, 6.f);
+                        float c = std::clamp(std::min(k, 4.f - k), 0.f, 1.f);
+                        return static_cast<uint8_t>(std::clamp(v < 0.5f ? c * v * 2.f : c + (1.f - c) * (v - 0.5f) * 2.f, 0.f, 1.f) * 255.f);
+                    };
+                    s.at(x, y) = l.adjustment.apply(Color::rgba(ch(5.f), ch(3.f), ch(1.f)));
+                }
+            return s;
+        }
+    }
+    return Surface(w, h);
+}
+
+// The mask as grey (white shows the layer, black hides it), at thumbnail size.
+Surface maskPreview(const Surface& mask, int w, int h) {
+    Surface s(w, h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            uint8_t v = 255 - mask.at(std::min(mask.width() - 1, x * mask.width() / w), std::min(mask.height() - 1, y * mask.height() / h)).a;
+            s.at(x, y) = Color::rgba(v, v, v);
+        }
+    return s;
+}
+
+}  // namespace
 
 void paintLayer(const RECT& r) {
     Document& doc = g.state.doc;
@@ -796,7 +862,9 @@ void paintLayer(const RECT& r) {
         RECT eye = rc(row.left, row.top, row.left + S(28), row.bottom);
         int indent = (!paper && l->clipToBelow) ? S(10) : 0;
         RECT thumb = rc(eye.right + S(4) + indent, row.top + (lrH - thH) / 2, eye.right + S(4) + indent + thW, row.top + (lrH + thH) / 2);
-        RECT txt = rc(thumb.right + S(8), row.top, row.right - S(28), row.bottom);
+        const bool masked = !paper && l->hasMask();
+        RECT maskTh = rc(thumb.right + S(5), thumb.top, thumb.right + S(5) + thW, thumb.bottom);
+        RECT txt = rc((masked ? maskTh.right : thumb.right) + S(8), row.top, row.right - S(28), row.bottom);
         if (need(row)) {
             fillRect(row, sel ? T().selection : hovered(row) ? mix(T().palette, T().buttonHover, 0.5f) : T().palette);
             fillRect(rc(row.left, row.bottom - 1, row.right, row.bottom), T().border);
@@ -807,15 +875,34 @@ void paintLayer(const RECT& r) {
                 fillRectC(thumb, doc.paperColor);
             } else {
                 auto& tb2 = g.thumbs[l->id];
-                if (!tb2) tb2 = thumbnail(l->surface, thW, thH, true);
+                if (!tb2) tb2 = thumbnail(layerPreview(doc, *l, thW * 2, thH * 2), thW, thH, true);
                 P.gx->DrawImage(tb2.get(), thumb.left, thumb.top, thW, thH);
+                if (masked) {
+                    auto& mb = g.thumbs[l->id | (1ull << 63)];
+                    if (!mb) mb = thumbnail(maskPreview(l->mask, thW * 2, thH * 2), thW, thH, false);
+                    P.gx->DrawImage(mb.get(), maskTh.left, maskTh.top, thW, thH);
+                    frameRect(inset(maskTh, -1), T().border);
+                    if (!l->maskEnabled) {  // a disabled mask: a red cross over its thumbnail
+                        gp::Pen pen(gp::Color(255, 214, 64, 64), static_cast<float>(S(2)));
+                        P.gx->DrawLine(&pen, static_cast<INT>(maskTh.left), static_cast<INT>(maskTh.top), static_cast<INT>(maskTh.right),
+                                       static_cast<INT>(maskTh.bottom));
+                        P.gx->DrawLine(&pen, static_cast<INT>(maskTh.left), static_cast<INT>(maskTh.bottom), static_cast<INT>(maskTh.right),
+                                       static_cast<INT>(maskTh.top));
+                    }
+                }
             }
             frameRect(inset(thumb, -1), T().border);
+            // The selected layer's edit target (pixels or mask) gets an accent frame.
+            if (sel && masked) frameRect(inset(l->paintsMask() ? maskTh : thumb, -2), T().accent, 2);
             if (paper) {
                 text(txt, L"Paper", T().text);
             } else {
                 wchar_t buf[96];
-                swprintf(buf, 96, L"%d %%  %s", static_cast<int>(l->opacity * 100 + 0.5f), kBlendNames[static_cast<int>(l->mode)]);
+                if (l->isRaster())
+                    swprintf(buf, 96, L"%d %%  %s", static_cast<int>(l->opacity * 100 + 0.5f), kBlendNames[static_cast<int>(l->mode)]);
+                else
+                    swprintf(buf, 96, L"%hs  %d %%  %s", layerKindName(l->kind), static_cast<int>(l->opacity * 100 + 0.5f),
+                             kBlendNames[static_cast<int>(l->mode)]);
                 text(rc(txt.left, txt.top + S(4), txt.right, txt.top + lrH / 2), buf, T().textDim, Left, g.fontSmall.get());
                 RECT nameR = rc(txt.left, txt.top + lrH / 2 - S(2), txt.right, txt.bottom - S(4));
                 if (!(g.edit && g.renameId == l->id)) text(nameR, widen(l->name), T().text);
@@ -834,6 +921,36 @@ void paintLayer(const RECT& r) {
             continue;
         }
         he.press = [idx](int, int) { g.state.toggleVisible(static_cast<size_t>(idx)); contentChanged(); };
+        // Thumbnails: choose what pixel tools edit (the layer or its mask);
+        // double-click a generated layer's thumbnail for its settings.
+        if (masked || !l->isRaster()) {
+            RECT th;
+            IntersectRect(&th, &thumb, &list);
+            Hit& ht = addHit(th, l->isRaster() ? L"Edit the layer" : L"Double-click for the layer's settings");
+            ht.wheel = bgHit.wheel;
+            ht.press = [idx](int, int) {
+                g.state.doc.setActiveIndex(static_cast<size_t>(idx));
+                if (g.state.active()->isRaster()) g.state.setEditMask(false);
+                invalidateAll();
+            };
+            ht.dbl = [] { defer(layerSettingsDialog); };
+        }
+        if (masked) {
+            RECT mh;
+            IntersectRect(&mh, &maskTh, &list);
+            Hit& hm = addHit(mh, L"Edit the layer mask (Shift+click: enable/disable)");
+            hm.wheel = bgHit.wheel;
+            hm.press = [idx](int, int) {
+                g.state.doc.setActiveIndex(static_cast<size_t>(idx));
+                if (GetKeyState(VK_SHIFT) < 0) {
+                    g.state.toggleMaskEnabled();
+                    contentChanged();
+                    return;
+                }
+                g.state.setEditMask(true);
+                invalidateAll();
+            };
+        }
         Hit& hr = addHit(visible);
         hr.wheel = bgHit.wheel;
         int listTop = list.top, scroll = g.layerScroll;
@@ -922,6 +1039,8 @@ void editLayerProps(const std::function<void(Layer&)>& fn) {
     contentChanged();
 }
 
+}  // namespace
+
 bool pickColorDialog(Color& c) {
     static COLORREF custom[16]{};
     CHOOSECOLORW cc{};
@@ -934,6 +1053,8 @@ bool pickColorDialog(Color& c) {
     c = Color::rgba(GetRValue(cc.rgbResult), GetGValue(cc.rgbResult), GetBValue(cc.rgbResult));
     return true;
 }
+
+namespace {
 
 // A colour well; clicking opens the colour dialog and stores the result through `set`.
 void colorWell(const RECT& r, Color c, const wchar_t* tip, std::function<void(Color)> set) {

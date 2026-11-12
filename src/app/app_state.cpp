@@ -158,7 +158,8 @@ void AppState::newDocument(int w, int h, double dpi) {
 
 bool AppState::openFile(const std::string& path, std::string* error) {
     std::string lp = lower(path);
-    if (endsWith(lp, ".clip")) {
+    bool legacy = endsWith(lp, ".lip");
+    if (endsWith(lp, ".clip") || legacy) {
         Document d;
         if (!clip::readClipFile(path, d, error)) return false;
         stroke_.reset();
@@ -174,9 +175,11 @@ bool AppState::openFile(const std::string& path, std::string* error) {
     }
     propEdit_.reset();
     undo = std::make_unique<UndoStack>(doc);
-    filePath = path;
+    // .lip is read-only here: Save writes a .clip next to it rather than overwriting the original.
+    filePath = legacy ? path.substr(0, path.size() - 4) + ".clip" : path;
     dirty = false;
     status = "Opened " + path;
+    if (legacy) status += " (saves as .clip)";
     return true;
 }
 
@@ -200,12 +203,22 @@ bool AppState::editableLayer(Layer*& l) {
     return true;
 }
 
+bool AppState::paintableLayer(Layer*& l) {
+    if (!editableLayer(l)) return false;
+    if (!l->isRaster() && !l->hasMask()) {
+        status = std::string("A ") + layerKindName(l->kind) + " layer has no pixels: add a layer mask to paint on it";
+        return false;
+    }
+    return true;
+}
+
 void AppState::beginStroke(float x, float y, float pressure, const BrushSettings& bs, const char* label) {
     Layer* l;
-    if (!editableLayer(l)) return;
+    if (!paintableLayer(l)) return;
     if (!l->visible) { status = "The layer is hidden"; return; }
-    stroke_ = std::make_unique<Stroke>(l->surface, bs);
+    stroke_ = std::make_unique<Stroke>(l->paintTarget(), bs);
     strokeLayer_ = l->id;
+    strokeMask_ = l->paintsMask();
     strokeLabel_ = label;
     stroke_->addPoint({x, y, pressure});
     applyAlphaLock(stroke_->lastDirtyRect());
@@ -222,14 +235,16 @@ void AppState::continueStroke(float x, float y, float pressure) {
 void AppState::applyAlphaLock(Rect r) {
     Layer* l = doc.findLayer(strokeLayer_);
     const Selection& sel = doc.selection;
-    if (!l || !stroke_ || (!l->lockAlpha && !sel.active)) return;
+    const bool lockAlpha = l && l->lockAlpha && !strokeMask_;
+    if (!l || !stroke_ || (!lockAlpha && !sel.active)) return;
     r = r.intersect(doc.bounds());
     const Surface& orig = stroke_->original();
+    Surface& target = strokeMask_ ? l->mask : l->surface;
     for (int y = r.y; y < r.bottom(); ++y) {
-        Color* d = l->surface.row(y);
+        Color* d = target.row(y);
         const Color* o = orig.row(y);
         for (int x = r.x; x < r.right(); ++x) {
-            if (l->lockAlpha) {
+            if (lockAlpha) {
                 if (o[x].a == 0) d[x] = o[x];
                 else if (d[x].a == 0) { d[x] = o[x]; }
                 else d[x].a = o[x].a;
@@ -247,8 +262,8 @@ Rect AppState::endStroke() {
     Layer* l = doc.findLayer(strokeLayer_);
     if (l && !r.empty()) {
         Surface before = stroke_->original().crop(r);
-        Surface after = l->surface.crop(r);
-        undo->push(std::make_unique<PixelPatchCommand>(l->id, r, std::move(before), std::move(after), strokeLabel_));
+        Surface after = (strokeMask_ ? l->mask : l->surface).crop(r);
+        undo->push(std::make_unique<PixelPatchCommand>(l->id, r, std::move(before), std::move(after), strokeLabel_, strokeMask_));
         dirty = true;
     }
     stroke_.reset();
@@ -257,7 +272,10 @@ Rect AppState::endStroke() {
 
 Rect AppState::floodFill(int sx, int sy, const Surface& ref, int tolerance, int expand, Color color, bool erase) {
     Layer* l;
-    if (!editableLayer(l)) return Rect{};
+    if (!paintableLayer(l)) return Rect{};
+    const bool onMask = l->paintsMask();
+    const bool lockAlpha = l->lockAlpha && !onMask;
+    Surface& target = l->paintTarget();
     int w = doc.width(), h = doc.height();
     if (sx < 0 || sy < 0 || sx >= w || sy >= h || ref.width() != w || ref.height() != h) return Rect{};
     const Color seed = ref.at(sx, sy);
@@ -309,19 +327,19 @@ Rect AppState::floodFill(int sx, int sy, const Surface& ref, int tolerance, int 
     Rect r = Rect::fromLTRB(minX, minY, maxX + 1, maxY + 1);
     if (doc.selection.active) r = r.intersect(doc.selection.bounds);
     if (r.empty()) { status = "The fill area is outside the selection"; return Rect{}; }
-    Surface before = l->surface.crop(r);
+    Surface before = target.crop(r);
     for (int y = r.y; y < r.bottom(); ++y) {
-        Color* d = l->surface.row(y);
+        Color* d = target.row(y);
         for (int x = r.x; x < r.right(); ++x) {
             if (!mask[static_cast<size_t>(y) * w + x]) continue;
             Color o = d[x];
             if (erase) d[x] = Color{};
-            else if (l->lockAlpha) { if (d[x].a) d[x] = Color::rgba(color.r, color.g, color.b, d[x].a); }
+            else if (lockAlpha) { if (d[x].a) d[x] = Color::rgba(color.r, color.g, color.b, d[x].a); }
             else d[x] = color;
             d[x] = maskMix(o, d[x], doc.selection.at(x, y));
         }
     }
-    undo->push(std::make_unique<PixelPatchCommand>(l->id, r, std::move(before), l->surface.crop(r), "Fill"));
+    undo->push(std::make_unique<PixelPatchCommand>(l->id, r, std::move(before), target.crop(r), "Fill", onMask));
     dirty = true;
     return r;
 }
@@ -329,12 +347,23 @@ Rect AppState::floodFill(int sx, int sy, const Surface& ref, int tolerance, int 
 Rect AppState::drawGradient(float x0, float y0, float x1, float y1, Color a, Color b, float opacity) {
     Layer* l;
     if (!editableLayer(l)) return Rect{};
+    // On a gradient layer (not its mask) the drag sets where its gradient runs.
+    if (l->kind == LayerKind::Gradient && !l->editingMask) {
+        GradientFill g = l->gradient;
+        g.x0 = x0; g.y0 = y0; g.x1 = x1; g.y1 = y1;
+        setGradient(g);
+        return doc.bounds();
+    }
+    if (!paintableLayer(l)) return Rect{};
+    const bool onMask = l->paintsMask();
+    const bool lockAlpha = l->lockAlpha && !onMask;
+    Surface& target = l->paintTarget();
     float dx = x1 - x0, dy = y1 - y0, len2 = dx * dx + dy * dy;
     const Selection& sel = doc.selection;
     Rect area = sel.active ? sel.bounds : doc.bounds();
-    Surface before = l->surface.crop(area);
+    Surface before = target.crop(area);
     for (int y = area.y; y < area.bottom(); ++y) {
-        Color* d = l->surface.row(y);
+        Color* d = target.row(y);
         for (int x = area.x; x < area.right(); ++x) {
             uint8_t m = sel.at(x, y);
             if (!m) continue;
@@ -342,21 +371,22 @@ Rect AppState::drawGradient(float x0, float y0, float x1, float y1, Color a, Col
             auto lerp = [t](uint8_t p, uint8_t q) { return static_cast<uint8_t>(p + (q - p) * t + 0.5f); };
             Color src = Color::rgba(lerp(a.r, b.r), lerp(a.g, b.g), lerp(a.b, b.b), lerp(a.a, b.a));
             uint8_t oldA = d[x].a;
-            if (l->lockAlpha && oldA == 0) continue;
+            if (lockAlpha && oldA == 0) continue;
             d[x] = blendPixel(d[x], src, BlendMode::Normal, opacity * m / 255.f);
-            if (l->lockAlpha) d[x].a = oldA;
+            if (lockAlpha) d[x].a = oldA;
         }
     }
-    undo->push(std::make_unique<PixelPatchCommand>(l->id, area, std::move(before), l->surface.crop(area), "Gradient"));
+    undo->push(std::make_unique<PixelPatchCommand>(l->id, area, std::move(before), target.crop(area), "Gradient", onMask));
     dirty = true;
     return area;
 }
 
 bool AppState::beginLayerMove() {
     Layer* l;
-    if (!editableLayer(l)) return false;
+    if (!paintableLayer(l)) return false;
     moveLayer_ = l->id;
-    moveOriginal_ = l->surface;
+    strokeMask_ = l->paintsMask();
+    moveOriginal_ = l->paintTarget();
     moveSelOriginal_ = doc.selection;
     moveDx_ = moveDy_ = 0;
     return true;
@@ -371,9 +401,10 @@ void AppState::previewLayerMove(int dx, int dy) {
     moveDy_ = dy;
     int w = doc.width(), h = doc.height();
     const Selection& s0 = moveSelOriginal_;
+    Surface& target = strokeMask_ ? l->mask : l->surface;
     if (!s0.active) {
         for (int y = 0; y < h; ++y) {
-            Color* d = l->surface.row(y);
+            Color* d = target.row(y);
             int sy = y - dy;
             if (sy < 0 || sy >= h) { std::fill(d, d + w, Color{}); continue; }
             const Color* s = moveOriginal_.row(sy);
@@ -386,7 +417,7 @@ void AppState::previewLayerMove(int dx, int dy) {
     }
     // Lift: the original with the selected part cut out (partially for soft edges).
     for (int y = 0; y < h; ++y) {
-        Color* d = l->surface.row(y);
+        Color* d = target.row(y);
         const Color* o = moveOriginal_.row(y);
         for (int x = 0; x < w; ++x) {
             d[x] = o[x];
@@ -398,7 +429,7 @@ void AppState::previewLayerMove(int dx, int dy) {
     std::fill(sel.mask.begin(), sel.mask.end(), uint8_t{0});
     Rect dst = Rect{s0.bounds.x + dx, s0.bounds.y + dy, s0.bounds.w, s0.bounds.h}.intersect(doc.bounds());
     for (int y = dst.y; y < dst.bottom(); ++y) {
-        Color* d = l->surface.row(y);
+        Color* d = target.row(y);
         const Color* o = moveOriginal_.row(y - dy);
         for (int x = dst.x; x < dst.right(); ++x) {
             uint8_t m = s0.at(x - dx, y - dy);
@@ -418,7 +449,8 @@ void AppState::endLayerMove() {
     Layer* l = doc.findLayer(moveLayer_);
     if (l && (moveDx_ || moveDy_)) {
         auto m = std::make_unique<MacroCommand>(moveSelOriginal_.active ? "Move selection" : "Move layer");
-        m->add(std::make_unique<PixelPatchCommand>(l->id, doc.bounds(), std::move(moveOriginal_), l->surface, ""));
+        m->add(std::make_unique<PixelPatchCommand>(l->id, doc.bounds(), std::move(moveOriginal_), strokeMask_ ? l->mask : l->surface, "",
+                                                   strokeMask_));
         if (moveSelOriginal_.active) m->add(std::make_unique<SelectionCommand>(std::move(moveSelOriginal_), doc.selection, ""));
         undo->push(std::move(m));
         dirty = true;
@@ -493,58 +525,196 @@ void AppState::endPropertyEdit() {
     }
 }
 
+void AppState::cancelPropertyEdit() {
+    if (!propEdit_) return;
+    auto [id, before] = *propEdit_;
+    propEdit_.reset();
+    if (Layer* l = doc.findLayer(id)) before.applyTo(*l);
+}
+
+std::pair<size_t, int> AppState::insertionPoint() const {
+    if (doc.layerCount() == 0) return {0, 0};
+    const size_t a = doc.activeIndex();
+    const Layer* l = doc.layer(a);
+    // Into a selected folder (at the top of its layers), else above the active layer.
+    if (l->isFolder()) return {a, l->depth + 1};
+    return {a + 1, l->depth};
+}
+
 void AppState::addLayer() {
-    size_t idx = doc.layerCount() ? doc.activeIndex() + 1 : 0;
-    int n = 1;
-    for (size_t i = 0; i < doc.layerCount(); ++i) {
-        const std::string& nm = doc.layer(i)->name;
-        if (nm.rfind("Layer ", 0) == 0) n = std::max(n, std::atoi(nm.c_str() + 6) + 1);
-    }
-    doc.addLayer("Layer " + std::to_string(n), idx);
-    undo->push(std::make_unique<AddLayerCommand>(nullptr, idx));
+    auto l = std::make_unique<Layer>();
+    l->name = nextName("Layer");
+    l->surface.reset(doc.width(), doc.height());
+    insertNewLayer(std::move(l), "New raster layer");
+}
+
+void AppState::addFolder() {
+    auto l = std::make_unique<Layer>();
+    l->name = nextName("Folder");
+    l->kind = LayerKind::Folder;
+    insertNewLayer(std::move(l), "New folder");
+}
+
+void AppState::groupIntoFolder() {
+    if (doc.layerCount() == 0) return;
+    const size_t i = doc.activeIndex(), start = doc.blockStart(i);
+    const int d = doc.layer(i)->depth;
+    // Nest the block one level deeper, then put a folder on top of it.
+    auto before = doc.order(), after = before;
+    for (size_t k = start; k <= i; ++k) after[k].second += 1;
+    auto macro = std::make_unique<MacroCommand>("Create folder and insert layer");
+    doc.setOrder(after);
+    macro->add(std::make_unique<ReorderCommand>(std::move(before), std::move(after), ""));
+    auto f = std::make_unique<Layer>();
+    f->name = nextName("Folder");
+    f->kind = LayerKind::Folder;
+    f->depth = d;
+    doc.insertLayer(std::move(f), i + 1);
+    macro->add(std::make_unique<AddLayerCommand>(nullptr, i + 1));
+    undo->push(std::move(macro));
     dirty = true;
-    status = "New raster layer";
+    status = "Put the layer into a new folder";
 }
 
 void AppState::deleteLayer() {
-    if (doc.layerCount() <= 1) { status = "Cannot delete the last layer"; return; }
-    size_t idx = doc.activeIndex();
-    auto cmd = std::make_unique<RemoveLayerCommand>(idx);
-    cmd->redo(doc);
-    undo->push(std::move(cmd));
+    if (doc.layerCount() == 0) return;
+    const size_t i = doc.activeIndex(), start = doc.blockStart(i);
+    if (i - start + 1 >= doc.layerCount()) { status = "Cannot delete the last layer"; return; }
+    // A folder goes with its contents; remove from the top down so indices stay valid.
+    auto macro = std::make_unique<MacroCommand>(doc.layer(i)->isFolder() ? "Delete folder" : "Delete layer");
+    for (size_t k = i + 1; k-- > start;) {
+        auto cmd = std::make_unique<RemoveLayerCommand>(k);
+        cmd->redo(doc);
+        macro->add(std::move(cmd));
+    }
+    undo->push(std::move(macro));
+    doc.setActiveIndex(start > 0 ? start - 1 : 0);
     dirty = true;
     status = "Deleted layer";
 }
 
 void AppState::duplicateLayer() {
-    Layer* l = active();
-    if (!l) return;
-    auto copy = l->clone();
-    copy->id = 0;
-    copy->name += " copy";
-    size_t idx = doc.activeIndex() + 1;
-    doc.insertLayer(std::move(copy), idx);
-    undo->push(std::make_unique<AddLayerCommand>(nullptr, idx));
+    if (doc.layerCount() == 0) return;
+    const size_t i = doc.activeIndex(), start = doc.blockStart(i);
+    auto macro = std::make_unique<MacroCommand>("Duplicate layer");
+    // Copies of the block (a folder with its contents) go right above it.
+    for (size_t k = start; k <= i; ++k) {
+        auto copy = doc.layer(k)->clone();
+        copy->id = 0;
+        if (k == i) copy->name += " copy";
+        size_t at = i + 1 + (k - start);
+        doc.insertLayer(std::move(copy), at);
+        macro->add(std::make_unique<AddLayerCommand>(nullptr, at));
+    }
+    undo->push(std::move(macro));
+    doc.setActiveIndex(i + 1 + (i - start));
     dirty = true;
     status = "Duplicated layer";
 }
 
-void AppState::moveLayer(int delta) {
-    int to = static_cast<int>(doc.activeIndex()) + delta;
-    if (to < 0 || to >= static_cast<int>(doc.layerCount())) return;
-    moveLayerTo(doc.activeIndex(), static_cast<size_t>(to));
+namespace {
+
+// Moves the block [start, end] of `o` so it begins at index `at` of the order
+// without it, nested at `depth` (relative depths inside the block are kept).
+std::vector<std::pair<uint64_t, int>> moveBlock(const std::vector<std::pair<uint64_t, int>>& o, size_t start, size_t end, size_t at,
+                                                int depth) {
+    std::vector<std::pair<uint64_t, int>> block(o.begin() + static_cast<std::ptrdiff_t>(start), o.begin() + static_cast<std::ptrdiff_t>(end) + 1);
+    std::vector<std::pair<uint64_t, int>> rest;
+    for (size_t k = 0; k < o.size(); ++k)
+        if (k < start || k > end) rest.push_back(o[k]);
+    const int shift = depth - o[end].second;
+    for (auto& b : block) b.second += shift;
+    at = std::min(at, rest.size());
+    rest.insert(rest.begin() + static_cast<std::ptrdiff_t>(at), block.begin(), block.end());
+    return rest;
 }
 
-void AppState::moveLayerTo(size_t from, size_t to) {
-    if (from >= doc.layerCount() || to >= doc.layerCount() || from == to) return;
-    doc.moveLayer(from, to);
-    undo->push(std::make_unique<MoveLayerCommand>(from, to));
+}  // namespace
+
+void AppState::moveLayer(int delta) {
+    if (doc.layerCount() == 0 || delta == 0) return;
+    const size_t i = doc.activeIndex(), start = doc.blockStart(i), n = doc.layerCount();
+    const int d = doc.layer(i)->depth;
+    auto o = doc.order();
+    std::vector<std::pair<uint64_t, int>> next;
+    if (delta > 0) {
+        // Up: past the sibling block above, or out of the top of the folder.
+        size_t t = i + 1;
+        while (t < n && doc.layer(t)->depth > d) ++t;
+        if (t >= n) return;
+        if (doc.layer(t)->depth == d) next = moveBlock(o, start, i, t + 1 - (i - start + 1), d);
+        else next = moveBlock(o, start, i, t + 1 - (i - start + 1), d - 1);  // t is our folder: go above it
+    } else {
+        // Down: past the sibling block below, or out of the bottom of the folder.
+        if (start == 0) {
+            if (d == 0) return;
+            next = moveBlock(o, start, i, 0, d - 1);
+        } else if (doc.layer(start - 1)->depth == d) {
+            next = moveBlock(o, start, i, doc.blockStart(start - 1), d);
+        } else {
+            int parent = doc.parentOf(i);
+            next = moveBlock(o, start, i, parent >= 0 ? doc.blockStart(static_cast<size_t>(parent)) : start, d - 1);
+        }
+    }
+    if (next == o) return;
+    doc.setOrder(next);
+    undo->push(std::make_unique<ReorderCommand>(std::move(o), std::move(next), "Move layer"));
     dirty = true;
 }
 
+void AppState::moveLayerTo(size_t from, size_t to) {
+    // Kept for callers that think in flat indices: lands at `to`'s level.
+    if (from >= doc.layerCount() || to >= doc.layerCount() || from == to) return;
+    moveBlockTo(from, to > from ? to + 1 : to, doc.layer(to)->depth);
+}
+
+// Moves layer `from` (with its contents when it is a folder) so that it sits
+// just below index `at` of the current stack, at nesting `depth`.  Dropping a
+// folder into itself is ignored.
+void AppState::moveBlockTo(size_t from, size_t at, int depth) {
+    if (from >= doc.layerCount()) return;
+    const size_t start = doc.blockStart(from);
+    if (at > start && at <= from) return;  // inside its own block (or no move)
+    if (depth < 0) depth = 0;
+    auto o = doc.order();
+    size_t rel = at > from ? at - (from - start + 1) : at;
+    auto next = moveBlock(o, start, from, rel, depth);
+    if (next == o) return;
+    doc.setOrder(next);
+    undo->push(std::make_unique<ReorderCommand>(std::move(o), std::move(next), "Move layer"));
+    dirty = true;
+}
+
+void AppState::toggleExpanded(size_t index) {
+    if (Layer* l = doc.layer(index); l && l->isFolder()) l->expanded = !l->expanded;
+}
+
+void AppState::togglePassThrough() {
+    Layer* l = active();
+    if (!l || !l->isFolder()) return;
+    auto b = LayerPropertyCommand::Props::from(*l);
+    l->passThrough = !l->passThrough;
+    pushProps(*l, b);
+    status = l->passThrough ? "Folder blends through" : "Folder is composited on its own";
+}
+
 void AppState::selectLayer(int delta) {
-    int i = static_cast<int>(doc.activeIndex()) + delta;
-    i = std::clamp(i, 0, static_cast<int>(doc.layerCount()) - 1);
+    // Steps through the rows the Layer palette shows (skipping collapsed folders' contents).
+    int i = static_cast<int>(doc.activeIndex());
+    const int n = static_cast<int>(doc.layerCount());
+    auto listed = [&](int k) {
+        for (int p = doc.parentOf(static_cast<size_t>(k)); p >= 0; p = doc.parentOf(static_cast<size_t>(p)))
+            if (!doc.layer(static_cast<size_t>(p))->expanded) return false;
+        return true;
+    };
+    int step = delta > 0 ? 1 : -1;
+    for (int left = std::abs(delta); left > 0;) {
+        int k = i + step;
+        while (k >= 0 && k < n && !listed(k)) k += step;
+        if (k < 0 || k >= n) break;
+        i = k;
+        --left;
+    }
     doc.setActiveIndex(static_cast<size_t>(i));
 }
 
@@ -665,8 +835,8 @@ void AppState::invertSelection() {
 void AppState::clearOutsideSelection() {
     Layer* l;
     if (!doc.selection.active) { status = "There is no selection"; return; }
-    if (!editableLayer(l)) return;
-    Surface s = l->surface;
+    if (!paintableLayer(l)) return;
+    Surface s = l->paintTarget();
     for (int y = 0; y < s.height(); ++y) {
         Color* p = s.row(y);
         for (int x = 0; x < s.width(); ++x) p[x].a = static_cast<uint8_t>(p[x].a * doc.selection.at(x, y) / 255);
@@ -675,30 +845,32 @@ void AppState::clearOutsideSelection() {
 }
 
 void AppState::replaceLayerPixels(Layer& l, Surface after, const char* label, bool masked) {
+    const bool onMask = l.paintsMask();
+    Surface& target = l.paintTarget();
     if (masked && doc.selection.active) {
         for (int y = 0; y < after.height(); ++y) {
             Color* d = after.row(y);
-            const Color* o = l.surface.row(y);
+            const Color* o = target.row(y);
             for (int x = 0; x < after.width(); ++x) d[x] = maskMix(o[x], d[x], doc.selection.at(x, y));
         }
     }
-    Surface before = l.surface;
-    l.surface = after;
-    undo->push(std::make_unique<PixelPatchCommand>(l.id, doc.bounds(), std::move(before), std::move(after), label));
+    Surface before = target;
+    target = after;
+    undo->push(std::make_unique<PixelPatchCommand>(l.id, doc.bounds(), std::move(before), std::move(after), label, onMask));
     dirty = true;
 }
 
 void AppState::clearLayer() {
     Layer* l;
-    if (!editableLayer(l)) return;
+    if (!paintableLayer(l)) return;
     replaceLayerPixels(*l, Surface(doc.width(), doc.height()), "Clear");
 }
 
 void AppState::fillLayer(Color c) {
     Layer* l;
-    if (!editableLayer(l)) return;
-    Surface s = l->surface;
-    if (l->lockAlpha) {
+    if (!paintableLayer(l)) return;
+    Surface s = l->paintTarget();
+    if (l->lockAlpha && !l->paintsMask()) {
         for (int y = 0; y < s.height(); ++y)
             for (int x = 0; x < s.width(); ++x) { Color& p = s.at(x, y); if (p.a) p = Color::rgba(c.r, c.g, c.b, p.a); }
     } else {
@@ -707,89 +879,321 @@ void AppState::fillLayer(Color c) {
     replaceLayerPixels(*l, std::move(s), "Fill");
 }
 
+namespace {
+
+// The base of a merge as a plain layer: its own pixels/content through its
+// mask, without the properties that stay on the merged layer.
+std::unique_ptr<Layer> mergeBase(const Layer& l) {
+    auto c = l.clone();
+    c->visible = true;
+    c->opacity = 1.f;
+    c->mode = BlendMode::Normal;
+    c->clipToBelow = false;
+    c->gray = c->layerColorOn = c->borderOn = false;
+    return c;
+}
+
+}  // namespace
+
 void AppState::mergeDown() {
     size_t idx = doc.activeIndex();
-    if (idx == 0) { status = "There is no layer below to merge into"; return; }
     Layer* top = doc.layer(idx);
-    Layer* below = doc.layer(idx - 1);
+    if (!top) return;
+    const size_t start = doc.blockStart(idx);
+    if (start == 0 || doc.layer(start - 1)->depth != top->depth) { status = "There is no layer below to merge into"; return; }
+    const size_t belowIdx = start - 1;
+    Layer* below = doc.layer(belowIdx);
+    if (top->isFolder() || below->isFolder()) { status = "Cannot merge with a folder (rasterize the folder first)"; return; }
     if (below->locked) { status = "The layer below is locked"; return; }
-    Surface before = below->surface;
-    Surface src = top->surface;
-    if (top->clipToBelow) {
-        for (int y = 0; y < src.height(); ++y)
-            for (int x = 0; x < src.width(); ++x) src.at(x, y).a = static_cast<uint8_t>(src.at(x, y).a * below->surface.at(x, y).a / 255);
-    }
-    blendSurface(below->surface, src, 0, 0, top->mode, top->visible ? top->opacity : 0.f, doc.bounds());
+    if (below->kind == LayerKind::Adjustment) { status = "Cannot merge into a correction layer"; return; }
+    // Composite the two (the lower one as a plain layer) and keep the result
+    // as the lower layer's pixels.  This handles every kind of upper layer,
+    // its mask and clipping; the lower layer's mask is baked in.
+    Document tmp(doc.width(), doc.height());
+    tmp.paperVisible = false;
+    auto b = mergeBase(*below);
+    b->depth = 0;
+    tmp.insertLayer(std::move(b), 0);
+    auto t = top->clone();
+    if (!t->visible) t->opacity = 0.f;
+    t->visible = true;
+    t->depth = 0;
+    tmp.insertLayer(std::move(t), 1);
+    auto before = below->clone();
+    below->surface = tmp.flatten();
+    below->kind = LayerKind::Raster;
+    below->mask = Surface();
+    below->editingMask = false;
     auto macro = std::make_unique<MacroCommand>("Merge with layer below");
-    macro->add(std::make_unique<PixelPatchCommand>(below->id, doc.bounds(), std::move(before), below->surface));
+    macro->add(std::make_unique<LayerSnapshotCommand>(*before, *below, ""));
     auto rm = std::make_unique<RemoveLayerCommand>(idx);
     rm->redo(doc);
     macro->add(std::move(rm));
     undo->push(std::move(macro));
-    doc.setActiveIndex(idx - 1);
+    doc.setActiveIndex(belowIdx);
     dirty = true;
     status = "Merged with layer below";
 }
 
 void AppState::mergeVisible() {
-    std::vector<size_t> visible;
-    for (size_t i = 0; i < doc.layerCount(); ++i)
-        if (doc.layer(i)->visible) visible.push_back(i);
-    if (visible.size() < 2) { status = "Need two visible layers to merge"; return; }
-    // Composite the visible layers (without paper) into the bottom-most visible one.
-    Document tmp(doc.width(), doc.height());
-    tmp.paperVisible = false;
-    for (size_t i : visible) tmp.insertLayer(doc.layer(i)->clone(), tmp.layerCount());
-    Surface merged = tmp.flatten();
-    auto macro = std::make_unique<MacroCommand>("Merge visible layers");
-    Layer* base = doc.layer(visible.front());
-    Surface before = base->surface;
-    base->surface = merged;
-    auto b = LayerPropertyCommand::Props::from(*base);
-    base->mode = BlendMode::Normal;
-    base->opacity = 1.f;
-    base->clipToBelow = false;
-    macro->add(std::make_unique<PixelPatchCommand>(base->id, doc.bounds(), std::move(before), merged, "Merge"));
-    macro->add(std::make_unique<LayerPropertyCommand>(base->id, b, LayerPropertyCommand::Props::from(*base)));
-    for (size_t k = visible.size() - 1; k >= 1; --k) {
-        auto rm = std::make_unique<RemoveLayerCommand>(visible[k]);
-        rm->redo(doc);
-        macro->add(std::move(rm));
+    const size_t n = doc.layerCount();
+    // What goes: every shown layer, and shown folders all of whose contents go.
+    std::vector<bool> gone(n, false);
+    size_t shown = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (!doc.layer(i)->isFolder() && doc.shownInTree(i)) { gone[i] = true; ++shown; }
+    if (shown < 2) { status = "Need two visible layers to merge"; return; }
+    for (size_t i = 0; i < n; ++i) {
+        if (!doc.layer(i)->isFolder() || !doc.shownInTree(i)) continue;
+        bool all = true;
+        for (size_t k = doc.blockStart(i); k < i; ++k) all = all && gone[k];
+        gone[i] = all;
     }
+    Surface merged = [&] {
+        Document tmp(doc.width(), doc.height());
+        tmp.paperVisible = false;
+        for (size_t i = 0; i < n; ++i) tmp.insertLayer(doc.layer(i)->clone(), i);
+        return tmp.flatten();
+    }();
+    // The result takes the place of the lowest merged layer, at the level of
+    // its outermost merged folder.
+    size_t lowest = 0;
+    while (!gone[lowest]) ++lowest;
+    int depth = doc.layer(lowest)->depth;
+    for (int p = doc.parentOf(lowest); p >= 0; p = doc.parentOf(static_cast<size_t>(p)))
+        if (gone[static_cast<size_t>(p)]) depth = doc.layer(static_cast<size_t>(p))->depth;
+    auto layer = std::make_unique<Layer>();
+    layer->name = doc.layer(lowest)->name;
+    layer->surface = std::move(merged);
+    layer->depth = depth;
+    auto macro = std::make_unique<MacroCommand>("Merge visible layers");
+    for (size_t k = n; k-- > 0;)
+        if (gone[k]) {
+            auto rm = std::make_unique<RemoveLayerCommand>(k);
+            rm->redo(doc);
+            macro->add(std::move(rm));
+        }
+    doc.insertLayer(std::move(layer), lowest);
+    macro->add(std::make_unique<AddLayerCommand>(nullptr, lowest));
     undo->push(std::move(macro));
-    doc.setActiveIndex(visible.front());
+    doc.setActiveIndex(lowest);
     dirty = true;
     status = "Merged visible layers";
 }
 
-void AppState::flipLayer(bool horizontal) {
+// ---- non-raster layers -------------------------------------------------------
+
+std::string AppState::nextName(const std::string& base) const {
+    int n = 1;
+    const std::string prefix = base + " ";
+    for (size_t i = 0; i < doc.layerCount(); ++i) {
+        const std::string& nm = doc.layer(i)->name;
+        if (nm.rfind(prefix, 0) == 0) n = std::max(n, std::atoi(nm.c_str() + prefix.size()) + 1);
+    }
+    return prefix + std::to_string(n);
+}
+
+void AppState::insertNewLayer(std::unique_ptr<Layer> l, const char* msg) {
+    auto [idx, depth] = insertionPoint();
+    l->depth = depth;
+    doc.insertLayer(std::move(l), idx);
+    undo->push(std::make_unique<AddLayerCommand>(nullptr, idx));
+    dirty = true;
+    status = msg;
+}
+
+void AppState::addFillLayer(Color c) {
+    auto l = std::make_unique<Layer>();
+    l->name = nextName("Fill");
+    l->kind = LayerKind::Fill;
+    c.a = 255;
+    l->fillColor = c;
+    insertNewLayer(std::move(l), "New fill layer");
+}
+
+void AppState::addGradientLayer() {
+    auto l = std::make_unique<Layer>();
+    l->name = nextName("Gradient");
+    l->kind = LayerKind::Gradient;
+    Color a = mainColor, b = subColor;
+    a.a = b.a = 255;
+    l->gradient.stops = {{0.f, a}, {1.f, b}};
+    l->gradient.x0 = l->gradient.x1 = doc.width() / 2.f;
+    l->gradient.y0 = 0.f;
+    l->gradient.y1 = static_cast<float>(doc.height());
+    insertNewLayer(std::move(l), "New gradient layer (drag the gradient tool on it to change its direction)");
+}
+
+void AppState::addAdjustmentLayer(Adjustment::Kind k) {
+    auto l = std::make_unique<Layer>();
+    l->name = nextName(Adjustment::kindName(k));
+    l->kind = LayerKind::Adjustment;
+    l->adjustment = Adjustment::make(k);
+    insertNewLayer(std::move(l), "New correction layer");
+}
+
+void AppState::setFillColor(Color c) {
+    Layer* l = active();
+    if (!l || l->kind != LayerKind::Fill) return;
+    auto b = LayerPropertyCommand::Props::from(*l);
+    c.a = 255;
+    l->fillColor = c;
+    pushProps(*l, b);
+}
+
+void AppState::setGradient(const GradientFill& g) {
+    Layer* l = active();
+    if (!l || l->kind != LayerKind::Gradient || g.stops.empty()) return;
+    auto b = LayerPropertyCommand::Props::from(*l);
+    l->gradient = g;
+    std::stable_sort(l->gradient.stops.begin(), l->gradient.stops.end(), [](auto& p, auto& q) { return p.pos < q.pos; });
+    pushProps(*l, b);
+}
+
+void AppState::setAdjustment(Adjustment a) {
+    Layer* l = active();
+    if (!l || l->kind != LayerKind::Adjustment) return;
+    auto b = LayerPropertyCommand::Props::from(*l);
+    a.raw.clear();  // the file's parameters no longer describe it
+    a.rebuild();
+    l->adjustment = std::move(a);
+    pushProps(*l, b);
+}
+
+void AppState::rasterizeLayer() {
     Layer* l;
     if (!editableLayer(l)) return;
+    if (l->isRaster()) { status = "The layer is already a raster layer"; return; }
+    if (l->kind == LayerKind::Adjustment) { status = "A correction layer has no pixels to rasterize"; return; }
+    const size_t i = doc.activeIndex(), start = doc.blockStart(i);
+    Layer plain = *l;
+    plain.maskEnabled = false;  // the mask stays a mask
+    Surface px = doc.renderLayer(plain, doc.bounds());
+    auto before = l->clone();
+    auto macro = std::make_unique<MacroCommand>(l->isFolder() ? "Merge folder" : "Rasterize");
+    // A folder becomes one raster layer of its contents (which go).
+    for (size_t k = i; k-- > start;) {
+        auto rm = std::make_unique<RemoveLayerCommand>(k);
+        rm->redo(doc);
+        macro->add(std::move(rm));
+    }
+    l = doc.layer(start);
+    l->surface = std::move(px);
+    l->kind = LayerKind::Raster;
+    l->passThrough = false;
+    macro->add(std::make_unique<LayerSnapshotCommand>(*before, *l, ""));
+    undo->push(std::move(macro));
+    doc.setActiveIndex(start);
+    dirty = true;
+    status = before->isFolder() ? "Merged the folder into one layer" : "Rasterized";
+}
+
+// ---- masks -------------------------------------------------------------------
+
+void AppState::addMask() {
+    Layer* l;
+    if (!editableLayer(l)) return;
+    if (l->hasMask()) { status = "The layer already has a mask"; return; }
+    Surface m(doc.width(), doc.height());
+    const Selection& sel = doc.selection;
+    if (sel.active)
+        for (int y = 0; y < m.height(); ++y) {
+            Color* p = m.row(y);
+            for (int x = 0; x < m.width(); ++x) p[x].a = static_cast<uint8_t>(255 - sel.at(x, y));
+        }
+    l->mask = m;
+    l->maskEnabled = true;
+    l->editingMask = true;
+    undo->push(std::make_unique<LayerMaskCommand>(l->id, Surface(), std::move(m), sel.active ? "Mask outside selection" : "Create layer mask"));
+    dirty = true;
+    status = sel.active ? "Masked outside the selection" : "Created a layer mask: painting now masks, erasing reveals";
+}
+
+void AppState::deleteMask() {
+    Layer* l;
+    if (!editableLayer(l)) return;
+    if (!l->hasMask()) { status = "The layer has no mask"; return; }
+    Surface before = std::move(l->mask);
+    l->mask = Surface();
+    l->editingMask = false;
+    undo->push(std::make_unique<LayerMaskCommand>(l->id, std::move(before), Surface(), "Delete layer mask"));
+    dirty = true;
+    status = "Deleted the layer mask";
+}
+
+void AppState::applyMask() {
+    Layer* l;
+    if (!editableLayer(l)) return;
+    if (!l->hasMask()) { status = "The layer has no mask"; return; }
+    if (!l->isRaster()) { status = "Rasterize the layer first to apply its mask"; return; }
+    auto before = l->clone();
+    if (l->maskEnabled)
+        for (int y = 0; y < doc.height(); ++y) {
+            Color* p = l->surface.row(y);
+            const Color* m = l->mask.row(y);
+            for (int x = 0; x < doc.width(); ++x) p[x].a = static_cast<uint8_t>(p[x].a * (255 - m[x].a) / 255);
+        }
+    l->mask = Surface();
+    l->editingMask = false;
+    undo->push(std::make_unique<LayerSnapshotCommand>(*before, *l, "Apply mask to layer"));
+    dirty = true;
+    status = "Applied the mask to the layer";
+}
+
+void AppState::toggleMaskEnabled() {
+    Layer* l = active();
+    if (!l || !l->hasMask()) { status = "The layer has no mask"; return; }
+    auto b = LayerPropertyCommand::Props::from(*l);
+    l->maskEnabled = !l->maskEnabled;
+    pushProps(*l, b);
+    status = l->maskEnabled ? "Mask enabled" : "Mask disabled";
+}
+
+void AppState::setEditMask(bool on) {
+    Layer* l = active();
+    if (!l) return;
+    if (on && !l->hasMask()) { status = "The layer has no mask"; return; }
+    if (!on && !l->isRaster()) { status = std::string("A ") + layerKindName(l->kind) + " layer is edited through its mask"; return; }
+    l->editingMask = on;
+    status = on ? "Editing the layer mask" : "Editing the layer";
+}
+
+void AppState::flipLayer(bool horizontal) {
+    Layer* l;
+    if (!paintableLayer(l)) return;
+    const Surface& src = l->paintTarget();
     Surface s(doc.width(), doc.height());
     for (int y = 0; y < s.height(); ++y)
         for (int x = 0; x < s.width(); ++x)
-            s.at(x, y) = horizontal ? l->surface.at(s.width() - 1 - x, y) : l->surface.at(x, s.height() - 1 - y);
+            s.at(x, y) = horizontal ? src.at(s.width() - 1 - x, y) : src.at(x, s.height() - 1 - y);
     replaceLayerPixels(*l, std::move(s), horizontal ? "Flip horizontal" : "Flip vertical");
 }
 
 void AppState::invertLayer() {
     Layer* l;
-    if (!editableLayer(l)) return;
-    Surface s = l->surface;
+    if (!paintableLayer(l)) return;
+    Surface s = l->paintTarget();
+    // On a mask, reversing swaps shown and hidden.
+    const bool onMask = l->paintsMask();
     for (int y = 0; y < s.height(); ++y)
-        for (Color* p = s.row(y), *e = p + s.width(); p != e; ++p) { p->r = 255 - p->r; p->g = 255 - p->g; p->b = 255 - p->b; }
+        for (Color* p = s.row(y), *e = p + s.width(); p != e; ++p) {
+            if (onMask) { p->a = 255 - p->a; continue; }
+            p->r = 255 - p->r; p->g = 255 - p->g; p->b = 255 - p->b;
+        }
     replaceLayerPixels(*l, std::move(s), "Reverse gradient");
 }
 
 void AppState::blurLayer(int radius) {
     Layer* l;
-    if (!editableLayer(l)) return;
+    if (!paintableLayer(l)) return;
+    const Surface& src = l->paintTarget();
+    const bool lockAlpha = l->lockAlpha && !l->paintsMask();
     int w = doc.width(), h = doc.height();
     // Box blur on premultiplied colour, horizontal then vertical.
     std::vector<float> a(static_cast<size_t>(w) * h * 4), b(a.size());
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
-            const Color& c = l->surface.at(x, y);
+            const Color& c = src.at(x, y);
             float al = c.a / 255.f;
             float* p = &a[(static_cast<size_t>(y) * w + x) * 4];
             p[0] = c.r * al; p[1] = c.g * al; p[2] = c.b * al; p[3] = static_cast<float>(c.a);
@@ -824,9 +1228,9 @@ void AppState::blurLayer(int radius) {
                 c.b = static_cast<uint8_t>(std::clamp(p[2] * inv + 0.5f, 0.f, 255.f));
             }
         }
-    if (l->lockAlpha)
+    if (lockAlpha)
         for (int y = 0; y < h; ++y)
-            for (int x = 0; x < w; ++x) s.at(x, y).a = l->surface.at(x, y).a;
+            for (int x = 0; x < w; ++x) s.at(x, y).a = src.at(x, y).a;
     replaceLayerPixels(*l, std::move(s), "Blur");
 }
 

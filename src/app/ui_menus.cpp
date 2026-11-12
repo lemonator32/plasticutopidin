@@ -40,6 +40,11 @@ void buildMenus() {
 
     HMENU l = CreatePopupMenu();
     add(l, CmdLayerNew, L"New raster layer\tCtrl+Shift+N");
+    add(l, CmdLayerNewFill, L"New fill layer...");
+    add(l, CmdLayerNewGradient, L"New gradient layer");
+    HMENU corr = CreatePopupMenu();
+    appendCorrectionMenu(corr);
+    AppendMenuW(l, MF_POPUP, reinterpret_cast<UINT_PTR>(corr), L"New correction layer");
     add(l, CmdLayerDup, L"Duplicate layer");
     add(l, CmdLayerDelete, L"Delete layer");
     sep(l);
@@ -48,6 +53,17 @@ void buildMenus() {
     add(l, CmdLayerClip, L"Clip at layer below\tCtrl+Alt+G");
     add(l, CmdLayerLock, L"Lock layer");
     add(l, CmdLayerLockAlpha, L"Lock transparent pixels");
+    add(l, CmdLayerSettings, L"Layer settings...");
+    add(l, CmdLayerRasterize, L"Rasterize");
+    sep(l);
+    HMENU mask = CreatePopupMenu();
+    add(mask, CmdMaskAdd, L"Create layer mask (masks outside a selection)");
+    add(mask, CmdMaskEdit, L"Edit layer mask\tCtrl+M");
+    add(mask, CmdMaskEnable, L"Enable mask");
+    add(mask, CmdMaskApply, L"Apply mask to layer");
+    add(mask, CmdMaskDelete, L"Delete layer mask");
+    AppendMenuW(l, MF_POPUP, reinterpret_cast<UINT_PTR>(mask), L"Layer mask");
+    g.maskMenu = mask;
     sep(l);
     add(l, CmdLayerMerge, L"Merge with layer below\tCtrl+E");
     add(l, CmdLayerMergeVisible, L"Merge visible layers\tCtrl+Shift+E");
@@ -116,6 +132,14 @@ void updateMenuStates() {
     check(g.menus[MenuLayer], CmdLayerLockAlpha, l && l->lockAlpha);
     enable(g.menus[MenuLayer], CmdLayerMerge, g.state.doc.activeIndex() > 0);
     enable(g.menus[MenuLayer], CmdLayerDelete, g.state.doc.layerCount() > 1);
+    const bool masked = l && l->hasMask();
+    enable(g.menus[MenuLayer], CmdLayerSettings, l && !l->isRaster());
+    enable(g.menus[MenuLayer], CmdLayerRasterize, l && (l->kind == LayerKind::Fill || l->kind == LayerKind::Gradient));
+    enable(g.maskMenu, CmdMaskAdd, l && !masked);
+    for (int c : {CmdMaskEdit, CmdMaskEnable, CmdMaskDelete}) enable(g.maskMenu, c, masked);
+    enable(g.maskMenu, CmdMaskApply, masked && l->isRaster());
+    check(g.maskMenu, CmdMaskEdit, masked && l->paintsMask());
+    check(g.maskMenu, CmdMaskEnable, masked && l->maskEnabled);
     check(g.menus[MenuView], CmdFlipView, g.state.view.flipH);
     check(g.menus[MenuView], CmdPaper, g.state.doc.paperVisible);
     for (int p = 0; p < PalCount; ++p) check(g.menus[MenuWindow], CmdPalBase + p, g.palVisible[p]);
