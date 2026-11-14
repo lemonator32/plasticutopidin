@@ -1,3 +1,7 @@
+# Folder for testing .clip files
+/test_files/
+
+# CMake files
 CMakeLists.txt.user
 CMakeCache.txt
 CMakeFiles
@@ -10,6 +14,7 @@ compile_commands.json
 CTestTestfile.cmake
 _deps
 CMakeUserPresets.json
+build/
 
 # CLion
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

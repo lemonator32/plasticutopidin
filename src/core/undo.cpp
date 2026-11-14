@@ -2,15 +2,15 @@
 
 namespace pu {
 
-PixelPatchCommand::PixelPatchCommand(uint64_t layerId, Rect rect, Surface before, Surface after, std::string label)
-    : layerId_(layerId), rect_(rect), before_(std::move(before)), after_(std::move(after)), label_(std::move(label)) {}
+PixelPatchCommand::PixelPatchCommand(uint64_t layerId, Rect rect, Surface before, Surface after, std::string label, bool mask)
+    : layerId_(layerId), rect_(rect), before_(std::move(before)), after_(std::move(after)), label_(std::move(label)), mask_(mask) {}
 
 void PixelPatchCommand::undo(Document& doc) {
-    if (Layer* l = doc.findLayer(layerId_)) l->surface.blit(before_, rect_.x, rect_.y);
+    if (Layer* l = doc.findLayer(layerId_)) (mask_ ? l->mask : l->surface).blit(before_, rect_.x, rect_.y);
 }
 
 void PixelPatchCommand::redo(Document& doc) {
-    if (Layer* l = doc.findLayer(layerId_)) l->surface.blit(after_, rect_.x, rect_.y);
+    if (Layer* l = doc.findLayer(layerId_)) (mask_ ? l->mask : l->surface).blit(after_, rect_.x, rect_.y);
 }
 
 AddLayerCommand::AddLayerCommand(std::unique_ptr<Layer> layer, size_t index) : layer_(std::move(layer)), index_(index) {}

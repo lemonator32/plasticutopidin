@@ -1,6 +1,7 @@
 // cliptool: inspect, extract and create CLIP STUDIO FORMAT (.clip) files.
 // Format work is done by libclip; the engine is used for compositing (export)
 // and for building documents from PNGs (create).
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +34,7 @@ static int usage() {
         "  cliptool preview <file.clip> <out.png>      save the embedded canvas preview\n"
         "  cliptool export <file.clip> <out.png>       flatten all layers to PNG\n"
         "  cliptool export-layers <file.clip> <dir>    one PNG per raster layer\n"
+        "  cliptool compare <file.clip> [sheet.png]    diff the composite against CSP's saved preview\n"
         "  cliptool create <out.clip> <layer1.png> [layer2.png ...]   build a .clip from PNG layers\n"
         "  cliptool roundtrip <in.clip> <out.clip>     read with this library and write again\n");
     return 2;
@@ -98,10 +100,29 @@ static int cmdInfo(const char* path) {
     std::printf("layers (top to bottom):\n");
     for (size_t i = 0; i < clip_document_layer_count(doc.get()); ++i) {
         const clip_layer_info& l = *clip_document_layer(doc.get(), i);
-        std::printf("  #%-3d %*s%s%-28s type=0x%x(%s) opacity=%3d%% blend=%s %s%s%s mipmap=%lld\n", (int)i, l.depth * 2, "",
+        std::printf("  #%-3d %*s%s%-28s type=0x%x(%s) opacity=%3d%% blend=%s %s%s%s mipmap=%lld", (int)i, l.depth * 2, "",
                     clip_layer_is_folder(&l) ? "[+] " : "", l.name, l.type, clip_layer_type_name(l.type), l.opacity * 100 / 256,
                     blendModeName(blendModeFromComposite(l.composite)), l.visible ? "" : "hidden ", l.locked ? "locked " : "",
                     l.clip ? "clip " : "", (long long)l.render_mipmap);
+        if (l.mask_mipmap && (l.type & 0x2)) std::printf(" mask=%s", clip_layer_mask_enabled(&l) ? "on" : "off");
+        if (clip_layer_is_filter(&l)) {
+            const uint8_t* b = l.filter_info;
+            uint32_t kind = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 8 | b[3];
+            uint32_t size = uint32_t(b[4]) << 24 | uint32_t(b[5]) << 16 | uint32_t(b[6]) << 8 | b[7];
+            std::printf(" filter=%u(%u bytes", kind, size);
+            for (size_t k = 8; k < l.filter_info_size && k < 8 + std::min<size_t>(size, 16); ++k) std::printf(" %02x", b[k]);
+            std::printf(")");
+        }
+        if (l.gradation_info) {
+            clip_gradient gr{};
+            if (clip_gradation_parse(l.gradation_info, l.gradation_info_size, &gr, nullptr))
+                std::printf(" gradient=%s shape=%d repeat=%d aa=%d ellipse=%.0f/%.0f/%.0f stops=%zu (%.0f,%.0f)-(%.0f,%.0f)",
+                            gr.fill ? "fill" : "stops", gr.shape, gr.repeat, gr.antialias, gr.ellipse[0], gr.ellipse[1], gr.ellipse[2],
+                            gr.stop_count, gr.x0, gr.y0, gr.x1, gr.y1);
+            else
+                std::printf(" gradient=unparsed");
+        }
+        std::printf("\n");
     }
     return 0;
 }
@@ -220,6 +241,111 @@ static int cmdExport(const char* path, const char* out) {
     return 0;
 }
 
+// Box-filters `s` down to w x h, compositing over white first so hidden colour
+// under transparent pixels does not count.
+static Surface downsampleOnWhite(const Surface& s, int w, int h) {
+    Surface out(w, h);
+    for (int oy = 0; oy < h; ++oy) {
+        int y0 = static_cast<int>(static_cast<int64_t>(oy) * s.height() / h);
+        int y1 = std::max(y0 + 1, static_cast<int>(static_cast<int64_t>(oy + 1) * s.height() / h));
+        for (int ox = 0; ox < w; ++ox) {
+            int x0 = static_cast<int>(static_cast<int64_t>(ox) * s.width() / w);
+            int x1 = std::max(x0 + 1, static_cast<int>(static_cast<int64_t>(ox + 1) * s.width() / w));
+            uint64_t r = 0, g = 0, b = 0, n = 0;
+            for (int y = y0; y < y1; ++y) {
+                const Color* p = s.row(y);
+                for (int x = x0; x < x1; ++x) {
+                    uint32_t a = p[x].a, ia = 255 - a;
+                    r += (p[x].r * a + 255 * ia) / 255;
+                    g += (p[x].g * a + 255 * ia) / 255;
+                    b += (p[x].b * a + 255 * ia) / 255;
+                    ++n;
+                }
+            }
+            out.at(ox, oy) = Color::rgba(static_cast<uint8_t>(r / n), static_cast<uint8_t>(g / n), static_cast<uint8_t>(b / n));
+        }
+    }
+    return out;
+}
+
+// Compares the engine's composite with the CanvasPreview Clip Studio Paint
+// saved in the file (its own render of the canvas).  Prints one line:
+//   compare <w>x<h> mae=<mean abs error 0..255> bad=<% pixels off by > 24> max=<..>
+// and, with an output path, writes [Plastic Paint | Clip Studio Paint | diff x4].
+static int cmdCompare(const char* path, const char* out) {
+    Document doc;
+    std::string err;
+    if (!readClipFile(path, doc, &err)) return fail(err);
+    DocumentPtr cd = openDoc(path);
+    if (!cd) return 1;
+    clip_image img{};
+    clip_error e{};
+    if (!clip_document_canvas_preview(cd.get(), &img, &e)) return fail(e.message);
+    Surface csp = downsampleOnWhite(toSurface(img), img.width, img.height);
+    clip_image_free(&img);
+    Surface ours = downsampleOnWhite(doc.flatten(), csp.width(), csp.height());
+    int w = csp.width(), h = csp.height();
+    uint64_t sum = 0, bad = 0;
+    int worst = 0;
+    Surface diff(w, h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const Color a = ours.at(x, y), b = csp.at(x, y);
+            int d = std::max({std::abs(a.r - b.r), std::abs(a.g - b.g), std::abs(a.b - b.b)});
+            sum += static_cast<uint64_t>(std::abs(a.r - b.r) + std::abs(a.g - b.g) + std::abs(a.b - b.b));
+            if (d > 24) ++bad;
+            worst = std::max(worst, d);
+            uint8_t v = static_cast<uint8_t>(std::min(255, d * 4));
+            diff.at(x, y) = Color::rgba(v, v, v);
+        }
+    double px = static_cast<double>(w) * h;
+    std::printf("compare %dx%d canvas=%dx%d mae=%.3f bad=%.3f%% max=%d\n", w, h, doc.width(), doc.height(), sum / (3 * px),
+                100.0 * bad / px, worst);
+    if (out) {
+        Surface sheet(w * 3, h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                sheet.at(x, y) = ours.at(x, y);
+                sheet.at(w + x, y) = csp.at(x, y);
+                sheet.at(2 * w + x, y) = diff.at(x, y);
+            }
+        if (!png::writeFile(out, sheet, &err)) return fail(err);
+    }
+    return 0;
+}
+
+static double previewError(const Document& doc, const Surface& csp) {
+    Surface ours = downsampleOnWhite(doc.flatten(), csp.width(), csp.height());
+    uint64_t sum = 0;
+    for (int y = 0; y < csp.height(); ++y)
+        for (int x = 0; x < csp.width(); ++x) {
+            const Color a = ours.at(x, y), b = csp.at(x, y);
+            sum += static_cast<uint64_t>(std::abs(a.r - b.r) + std::abs(a.g - b.g) + std::abs(a.b - b.b));
+        }
+    return sum / (3.0 * csp.width() * csp.height());
+}
+
+// For one LayerComposite code, renders the file once per engine blend mode and
+// prints the error of each against CSP's preview: which mode the code means.
+static int cmdCalibrate(const char* path, int code) {
+    DocumentPtr cd = openDoc(path);
+    if (!cd) return 1;
+    clip_image img{};
+    clip_error e{};
+    if (!clip_document_canvas_preview(cd.get(), &img, &e)) return fail(e.message);
+    Surface csp = downsampleOnWhite(toSurface(img), img.width, img.height);
+    clip_image_free(&img);
+    for (int m = 0; m < static_cast<int>(BlendMode::Count); ++m) {
+        setCompositeOverride(code, static_cast<BlendMode>(m));
+        Document doc;
+        std::string err;
+        if (!readClipFile(path, doc, &err)) return fail(err);
+        std::printf("code %d as %-12s mae=%.3f\n", code, blendModeName(static_cast<BlendMode>(m)), previewError(doc, csp));
+    }
+    setCompositeOverride(-1, BlendMode::Normal);
+    return 0;
+}
+
 static int cmdExportLayers(const char* path, const char* dir) {
     DocumentPtr doc = openDoc(path);
     if (!doc) return 1;
@@ -307,6 +433,8 @@ int main(int argc, char** argv) {
     if (cmd == "offscreen" && argc > 3) return cmdOffscreen(argv[2], std::atoi(argv[3]));
     if (cmd == "preview" && argc > 3) return cmdPreview(argv[2], argv[3]);
     if (cmd == "export" && argc > 3) return cmdExport(argv[2], argv[3]);
+    if (cmd == "calibrate" && argc > 3) return cmdCalibrate(argv[2], std::atoi(argv[3]));
+    if (cmd == "compare" && argc > 2) return cmdCompare(argv[2], argc > 3 ? argv[3] : nullptr);
     if (cmd == "export-layers" && argc > 3) return cmdExportLayers(argv[2], argv[3]);
     if (cmd == "create" && argc > 3) return cmdCreate(argv[2], argc - 3, argv + 3);
     if (cmd == "roundtrip" && argc > 3) return cmdRoundtrip(argv[2], argv[3]);

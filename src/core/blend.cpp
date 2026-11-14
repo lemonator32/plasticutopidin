@@ -74,8 +74,17 @@ inline float separable(BlendMode m, float cb, float cs) {
         }
         case BlendMode::Difference: return std::fabs(cb - cs);
         case BlendMode::Exclusion: return cb + cs - 2.f * cb * cs;
-        case BlendMode::Add: return std::min(1.f, cb + cs);
+        case BlendMode::Add:
+        case BlendMode::AddGlow: return std::min(1.f, cb + cs);
         case BlendMode::Subtract: return std::max(0.f, cb - cs);
+        case BlendMode::LinearBurn: return std::max(0.f, cb + cs - 1.f);
+        case BlendMode::GlowDodge: return separable(BlendMode::ColorDodge, cb, cs);
+        case BlendMode::VividLight:
+            return cs <= 0.5f ? separable(BlendMode::ColorBurn, cb, 2.f * cs) : separable(BlendMode::ColorDodge, cb, 2.f * cs - 1.f);
+        case BlendMode::LinearLight: return clamp01(cb + 2.f * cs - 1.f);
+        case BlendMode::PinLight: return cs <= 0.5f ? std::min(cb, 2.f * cs) : std::max(cb, 2.f * cs - 1.f);
+        case BlendMode::HardMix: return cb + cs >= 1.f ? 1.f : 0.f;
+        case BlendMode::Divide: return cs <= 0.f ? (cb > 0.f ? 1.f : 0.f) : std::min(1.f, cb / cs);
         default: return cs;  // Normal
     }
 }
@@ -86,6 +95,8 @@ F3 blendRGB(BlendMode m, F3 cb, F3 cs) {
         case BlendMode::Saturation: return setLum(setSat(cb, sat(cs)), lum(cb));
         case BlendMode::Color: return setLum(cs, lum(cb));
         case BlendMode::Luminosity: return setLum(cb, lum(cs));
+        case BlendMode::DarkerColor: return lum(cs) < lum(cb) ? cs : cb;
+        case BlendMode::LighterColor: return lum(cs) > lum(cb) ? cs : cb;
         default: return {separable(m, cb.r, cs.r), separable(m, cb.g, cs.g), separable(m, cb.b, cs.b)};
     }
 }
@@ -97,7 +108,10 @@ inline uint8_t to8(float v) { return static_cast<uint8_t>(clamp01(v) * 255.f + 0
 const char* blendModeName(BlendMode m) {
     static const char* names[] = {"Normal",     "Multiply",   "Screen",     "Overlay",  "Darken",     "Lighten",
                                   "ColorDodge", "ColorBurn",  "HardLight",  "SoftLight", "Difference", "Exclusion",
-                                  "Add",        "Subtract",   "Hue",        "Saturation", "Color",     "Luminosity"};
+                                  "Add",        "Subtract",   "Hue",        "Saturation", "Color",     "Luminosity",
+                                  "LinearBurn", "DarkerColor", "LighterColor", "GlowDodge", "AddGlow", "VividLight",
+                                  "LinearLight", "PinLight",  "HardMix",    "Divide"};
+    static_assert(sizeof(names) / sizeof(names[0]) == static_cast<size_t>(BlendMode::Count));
     size_t i = static_cast<size_t>(m);
     return i < static_cast<size_t>(BlendMode::Count) ? names[i] : "?";
 }

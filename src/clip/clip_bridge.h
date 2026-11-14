@@ -35,6 +35,9 @@ bool writeClipFile(const std::string& path, const Document& doc, const WriteOpti
 // CSP LayerComposite codes <-> engine blend modes (best effort).
 BlendMode blendModeFromComposite(int32_t composite);
 int32_t compositeFromBlendMode(BlendMode mode);
+// Calibration hook for `cliptool calibrate`: read composite `code` as `mode`
+// (code -1 turns the override off).
+void setCompositeOverride(int32_t code, BlendMode mode);
 
 // Surface <-> clip_image.  The view does not copy and must not outlive `s`.
 clip_image imageView(const Surface& s);

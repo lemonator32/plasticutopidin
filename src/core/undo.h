@@ -20,7 +20,8 @@ public:
 // so redo does not need to re-run the brush engine.
 class PixelPatchCommand : public Command {
 public:
-    PixelPatchCommand(uint64_t layerId, Rect rect, Surface before, Surface after, std::string label = "Paint");
+    // `mask`: the patch is of the layer's mask rather than its pixels.
+    PixelPatchCommand(uint64_t layerId, Rect rect, Surface before, Surface after, std::string label = "Paint", bool mask = false);
     const char* name() const override { return label_.c_str(); }
     void undo(Document& doc) override;
     void redo(Document& doc) override;
@@ -30,6 +31,67 @@ private:
     uint64_t layerId_;
     Rect rect_;
     Surface before_, after_;
+    std::string label_;
+    bool mask_;
+};
+
+// Replaces a layer's whole mask (adding one, deleting it, applying it).
+class LayerMaskCommand : public Command {
+public:
+    LayerMaskCommand(uint64_t layerId, Surface before, Surface after, std::string label)
+        : id_(layerId), before_(std::move(before)), after_(std::move(after)), label_(std::move(label)) {}
+    const char* name() const override { return label_.c_str(); }
+    void undo(Document& doc) override { set(doc, before_); }
+    void redo(Document& doc) override { set(doc, after_); }
+
+private:
+    void set(Document& doc, const Surface& m) {
+        if (Layer* l = doc.findLayer(id_)) {
+            l->mask = m;
+            if (m.empty()) l->editingMask = false;
+        }
+    }
+    uint64_t id_;
+    Surface before_, after_;
+    std::string label_;
+};
+
+// Restores the order and nesting of the whole stack (moving layers and
+// folders, putting layers into folders and taking them out).
+class ReorderCommand : public Command {
+public:
+    using Order = std::vector<std::pair<uint64_t, int>>;
+    ReorderCommand(Order before, Order after, std::string label)
+        : before_(std::move(before)), after_(std::move(after)), label_(std::move(label)) {}
+    const char* name() const override { return label_.c_str(); }
+    void undo(Document& doc) override { doc.setOrder(before_); }
+    void redo(Document& doc) override { doc.setOrder(after_); }
+
+private:
+    Order before_, after_;
+    std::string label_;
+};
+
+// Replaces a whole layer (pixels, mask, kind, settings) with a snapshot: for
+// edits that change what kind of layer it is (rasterize, merge, apply mask).
+class LayerSnapshotCommand : public Command {
+public:
+    LayerSnapshotCommand(const Layer& before, const Layer& after, std::string label)
+        : before_(before.clone()), after_(after.clone()), label_(std::move(label)) {}
+    const char* name() const override { return label_.c_str(); }
+    void undo(Document& doc) override { set(doc, *before_); }
+    void redo(Document& doc) override { set(doc, *after_); }
+
+private:
+    static void set(Document& doc, const Layer& snap) {
+        int i = doc.indexOf(snap.id);
+        if (i < 0) return;
+        size_t active = doc.activeIndex();
+        doc.removeLayer(static_cast<size_t>(i));
+        doc.insertLayer(snap.clone(), static_cast<size_t>(i));
+        doc.setActiveIndex(active);
+    }
+    std::unique_ptr<Layer> before_, after_;
     std::string label_;
 };
 
@@ -76,10 +138,26 @@ public:
         std::string name;
         BlendMode mode;
         float opacity;
-        bool visible, locked, clipToBelow;
-        static Props from(const Layer& l) { return {l.name, l.mode, l.opacity, l.visible, l.locked, l.clipToBelow}; }
+        bool visible, locked, clipToBelow, lockAlpha;
+        bool gray, layerColorOn, borderOn;
+        Color layerColor, borderColor;
+        int borderWidth;
+        bool maskEnabled, passThrough;
+        Color fillColor;
+        GradientFill gradient;
+        Adjustment adjustment;
+        bool operator==(const Props&) const = default;
+        static Props from(const Layer& l) {
+            return {l.name, l.mode, l.opacity, l.visible, l.locked, l.clipToBelow, l.lockAlpha,
+                    l.gray, l.layerColorOn, l.borderOn, l.layerColor, l.borderColor, l.borderWidth,
+                    l.maskEnabled, l.passThrough, l.fillColor, l.gradient, l.adjustment};
+        }
         void applyTo(Layer& l) const {
             l.name = name; l.mode = mode; l.opacity = opacity; l.visible = visible; l.locked = locked; l.clipToBelow = clipToBelow;
+            l.lockAlpha = lockAlpha;
+            l.gray = gray; l.layerColorOn = layerColorOn; l.borderOn = borderOn;
+            l.layerColor = layerColor; l.borderColor = borderColor; l.borderWidth = borderWidth;
+            l.maskEnabled = maskEnabled; l.passThrough = passThrough; l.fillColor = fillColor; l.gradient = gradient; l.adjustment = adjustment;
         }
     };
     LayerPropertyCommand(uint64_t layerId, Props before, Props after) : id_(layerId), before_(before), after_(after) {}
@@ -90,6 +168,36 @@ public:
 private:
     uint64_t id_;
     Props before_, after_;
+};
+
+// A change of the selected area.
+class SelectionCommand : public Command {
+public:
+    SelectionCommand(Selection before, Selection after, std::string label)
+        : before_(std::move(before)), after_(std::move(after)), label_(std::move(label)) {}
+    const char* name() const override { return label_.c_str(); }
+    void undo(Document& doc) override { doc.selection = before_; }
+    void redo(Document& doc) override { doc.selection = after_; }
+
+private:
+    Selection before_, after_;
+    std::string label_;
+};
+
+// Several commands that undo and redo as one step.  The parts must already
+// have been applied, in order; undo runs them in reverse.
+class MacroCommand : public Command {
+public:
+    explicit MacroCommand(std::string label) : label_(std::move(label)) {}
+    void add(std::unique_ptr<Command> c) { parts_.push_back(std::move(c)); }
+    bool empty() const { return parts_.empty(); }
+    const char* name() const override { return label_.c_str(); }
+    void undo(Document& doc) override { for (auto it = parts_.rbegin(); it != parts_.rend(); ++it) (*it)->undo(doc); }
+    void redo(Document& doc) override { for (auto& c : parts_) c->redo(doc); }
+
+private:
+    std::string label_;
+    std::vector<std::unique_ptr<Command>> parts_;
 };
 
 class UndoStack {
@@ -106,6 +214,10 @@ public:
     bool redo();
     void clear() { done_.clear(); undone_.clear(); }
     size_t size() const { return done_.size(); }
+    // For the History palette: done steps oldest first; undone steps in redo order (next redo first).
+    size_t redoSize() const { return undone_.size(); }
+    const char* doneName(size_t i) const { return done_[i]->name(); }
+    const char* redoNameAt(size_t i) const { return undone_[undone_.size() - 1 - i]->name(); }
 
 private:
     Document& doc_;
