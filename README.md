@@ -28,13 +28,23 @@ are trademarks of CELSYS, Inc.
   Hue/Saturation/Luminosity, Color balance, Reverse gradient, Posterization,
   Binarization and Gradient map. All of them are edited live from the Layer
   settings dialog and saved to `.clip`.
-* **18 blend modes**: Normal, Multiply, Screen, Overlay, Darken, Lighten,
-  Color Dodge, Color Burn, Hard Light, Soft Light, Difference, Exclusion,
-  Add, Subtract, Hue, Saturation, Color and Luminosity, following the W3C
-  *Compositing and Blending* formulas.
-* **Undo and redo** of the last 200 edits, including layer changes.
-* **Files**: opens `.clip` and `.png`, and saves `.clip`. Layer names, blend
-  modes, opacity and visibility survive the round trip to Clip Studio Paint.
+* **Selections**: rectangle, ellipse and lasso, with add, subtract and
+  invert; tools, fills and gradients respect them, and a selection can
+  become a layer mask.
+* **28 blend modes**: the W3C *Compositing and Blending* set (Normal,
+  Multiply, Screen, Overlay, Darken, Lighten, Color Dodge, Color Burn, Hard
+  Light, Soft Light, Difference, Exclusion, Add, Subtract, Hue, Saturation,
+  Color, Luminosity) plus Clip Studio Paint's Linear Burn, Darker Color,
+  Lighter Color, Glow Dodge, Add (Glow), Vivid Light, Linear Light, Pin
+  Light, Hard Mix and Divide.
+* **Layer Property effects**: gray expression colour, layer colour and
+  border effect, shown without changing the pixels.
+* **Undo and redo** of the last 200 edits, including layer changes, with a
+  History palette.
+* **Files**: opens `.clip` and `.png`, and saves `.clip` and `.png`. Layer
+  names, folders, masks, blend modes, opacity, visibility, effects and the
+  settings of fill, gradient and correction layers survive the round trip to
+  Clip Studio Paint.
 * **Unicode paths** everywhere: file dialogs, drag and drop and the command
   line.
 
@@ -84,24 +94,35 @@ Run `plastic_paint.exe`, optionally with a file to open:
 plastic_paint.exe "C:\art\picture.clip"
 ```
 
-You can also drag a `.clip` or `.png` onto the window. The window has the
-layer and tool panel on the left, the canvas on the right and a status bar
-below.
+You can also drag a `.clip` or `.png` onto the window. The workspace follows
+Clip Studio Paint: tool and colour palettes on the left, the canvas in the
+middle, and the Layer and History palettes on the right. Palettes can be
+docked on either side or hidden, and the Window menu switches between the
+dark and light theme.
+
+Non-raster layers are created from the Layer menu (new fill, gradient or
+correction layer) and edited in the **Layer settings** dialog, which also
+opens by double-clicking the layer's thumbnail. Right-click a layer for its
+context menu, including the layer mask commands. Press `F1` for the full
+shortcut list.
 
 | Keys | Action |
 |---|---|
-| `B` / `E` | Brush / eraser |
-| `[` `]` (`Shift` for bigger steps) | Brush size |
-| `{` `}` | Hardness |
-| `,` `.` | Brush opacity |
-| Click a swatch, `X` | Pick a colour / swap with white |
+| `P`, `B`, `E`, `G`, `K`, `M`, `I`, `H`, `R`, `/` | Pen, brush, eraser, fill/gradient, move layer, selection, eyedropper, hand, rotate, zoom |
+| `[` `]` | Brush size |
+| `,` `.` | Next / previous sub tool |
+| `Ctrl+[` `Ctrl+]` | Brush opacity |
+| `X`, `C` | Swap main and sub colour / transparent colour |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
-| `N`, `Delete`, `Ctrl+D`, `Ctrl+E` | New layer, delete, duplicate, merge down |
-| `PgUp` / `PgDn`, `Ctrl+Up` / `Ctrl+Down` | Select / move layer |
-| `V`, `M` / `Shift+M`, `+` / `-`, `C` | Visibility, blend mode, opacity, clip to layer below |
-| `Ctrl+Delete` | Clear layer |
-| `Ctrl+N`, `Ctrl+O`, `Ctrl+S`, `Ctrl+Shift+S` | New, open, save, save as |
-| Mouse wheel, `Space`+drag or right-drag, `F` | Zoom, pan, fit to window |
+| `Ctrl+Shift+N`, `Ctrl+E`, `Ctrl+Shift+E` | New raster layer, merge down, merge visible |
+| `Alt+]` / `Alt+[` | Select upper / lower layer |
+| `Ctrl+Alt+G`, `Ctrl+M` | Clip at layer below, edit layer mask |
+| `Delete`, `Ctrl+Delete` | Clear layer, clear outside the selection |
+| `Ctrl+A`, `Ctrl+D`, `Ctrl+Shift+I` | Select all, deselect, invert selection |
+| `Ctrl+N`, `Ctrl+O`, `Ctrl+S`, `Ctrl+Shift+S`, `Ctrl+W` | New, open, save, save as, close |
+| Mouse wheel, `Ctrl+0`, `Ctrl+Alt+0`, `-` / `^` | Zoom, fit, 100 %, rotate the view |
+| `Space`+drag or right-drag | Pan |
+| `Tab` | Hide all palettes |
 
 ## cliptool
 
@@ -117,13 +138,15 @@ cliptool offscreen <file.clip> <layer#>    decode one layer, report pixel stats
 cliptool preview <file.clip> <out.png>     embedded preview image
 cliptool export <file.clip> <out.png>      flattened image
 cliptool export-layers <file.clip> <dir>   one PNG per raster layer
+cliptool compare <file.clip> [sheet.png]   diff the composite against CSP's saved preview
 cliptool create <out.clip> <a.png> [b.png …]
 cliptool roundtrip <in.clip> <out.clip>
 ```
 
-`tables`, `schema` and `dump` work on any `.clip`, including files saved by
-Clip Studio Paint, so they are the quickest way to look at the parts of the
-format libclip doesn't model yet.
+`info` shows each layer's kind, mask state and the decoded settings of
+correction and gradient layers. `tables`, `schema` and `dump` work on any
+`.clip`, including files saved by Clip Studio Paint, so they are the
+quickest way to look at the parts of the format libclip doesn't model yet.
 
 ## Repository layout
 
@@ -132,9 +155,9 @@ src/
   core/        painting engine: images, blend modes, documents, brush, undo
                (no OS dependencies)
   clip/        clip_bridge: converts between libclip and the engine's Document
-  app/         the Windows application
+  app/         the Windows application (app_state: OS-free logic; ui_*: Win32 workspace)
   tools/       cliptool, previewprobe
-  tests/       engine and bridge tests
+  tests/       engine, bridge and app-state tests
 libclip/       the .clip library (git submodule; has its own README)
 docs/          research notes on Clip Studio Paint and design notes for src/
 ```
@@ -160,7 +183,12 @@ docs/          research notes on Clip Studio Paint and design notes for src/
 * Gradient layers from Clip Studio Paint are read when they are linear
   (the only shape seen in CSP files); a radial gradient layer is saved as
   pixels. A tone curve with per-channel curves is shown as read, and editing
-  it replaces those curves with one master curve.
+  it replaces those curves with one master curve. The Posterization and
+  Binarization file layouts are assumed, as no Clip Studio Paint file with
+  one was available.
+* Clip Studio Paint renders correction and gradient layers itself when it
+  opens a file, so small differences from Plastic Paint's rendering of the
+  same settings are expected.
 * Windows only for the application. The engine and `cliptool` are portable
   C++20.
 
