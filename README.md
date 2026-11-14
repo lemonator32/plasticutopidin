@@ -13,6 +13,8 @@ Plastic Paint is original code. It is not a port of Clip Studio Paint and
 is not affiliated with CELSYS. "Clip Studio Paint" and "CLIP STUDIO FORMAT"
 are trademarks of CELSYS, Inc.
 
+<img width="1967" height="1223" alt="image" src="https://github.com/user-attachments/assets/f14ec738-facc-438c-9279-5bc8c969b146" />
+
 ## Features
 
 * **Pen input** through `WM_POINTER`, with pressure controlling brush size
